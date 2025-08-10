@@ -9,6 +9,8 @@
 #include <ctype.h>
 #include <time.h>
 #include <stdarg.h>
+#include <sys/select.h>
+#include <unistd.h>
 #include "terminal.h"
 #include "buffer.h"
 #include "clipboard.h"
@@ -37,6 +39,7 @@ typedef struct {
     int search_query_capacity;
     int current_match;
     int total_matches;
+    volatile bool resize_pending;
 } Editor;
 
 Editor editor = {0};
@@ -74,8 +77,70 @@ void set_status_message(const char *fmt, ...) {
 
 void handle_resize(int sig) {
     (void)sig;
+    // Just set a flag - do the actual resize handling in main loop
+    editor.resize_pending = true;
+    // Re-register the signal handler (some systems need this)
+    signal(SIGWINCH, handle_resize);
+}
+
+void process_resize() {
+    if (!editor.resize_pending) return;
+    
+    // Get new window dimensions
+    int old_rows = editor.screen_rows;
+    int old_cols = editor.screen_cols;
+    
+    // Update to current size
     terminal_get_window_size(&editor.screen_rows, &editor.screen_cols);
-    editor.needs_full_redraw = true;
+    
+    // Sanity check - ensure we have valid dimensions
+    if (editor.screen_rows < 3) editor.screen_rows = 3; // Minimum for content + status
+    if (editor.screen_cols < 10) editor.screen_cols = 10; // Minimum for line numbers + text
+    
+    // Adjust scrolling if needed after resize
+    if (editor.screen_rows != old_rows || editor.screen_cols != old_cols) {
+        // Ensure cursor position is valid
+        if (editor.cursor_y >= editor.buffer->line_count) {
+            editor.cursor_y = editor.buffer->line_count - 1;
+            if (editor.cursor_y < 0) editor.cursor_y = 0;
+        }
+        
+        // Adjust cursor x to line length
+        if (editor.cursor_y >= 0 && editor.cursor_y < editor.buffer->line_count) {
+            int line_len = editor.buffer->lines[editor.cursor_y] ? 
+                           strlen(editor.buffer->lines[editor.cursor_y]) : 0;
+            if (editor.cursor_x > line_len) editor.cursor_x = line_len;
+            if (editor.cursor_x < 0) editor.cursor_x = 0;
+        }
+        
+        // Make sure cursor is still visible after resize
+        if (editor.cursor_y < editor.offset_y) {
+            editor.offset_y = editor.cursor_y;
+        } else if (editor.cursor_y >= editor.offset_y + editor.screen_rows - 1) {
+            editor.offset_y = editor.cursor_y - editor.screen_rows + 2;
+            if (editor.offset_y < 0) editor.offset_y = 0;
+        }
+        
+        // Adjust horizontal scrolling
+        int text_width = editor.screen_cols - editor.line_number_width;
+        if (text_width <= 0) text_width = 1; // Prevent division by zero
+        
+        if (editor.cursor_x < editor.offset_x) {
+            editor.offset_x = editor.cursor_x;
+        } else if (editor.cursor_x >= editor.offset_x + text_width) {
+            editor.offset_x = editor.cursor_x - text_width + 1;
+            if (editor.offset_x < 0) editor.offset_x = 0;
+        }
+        
+        // Force complete redraw and reset cached positions
+        editor.needs_full_redraw = true;
+        editor.last_offset_x = -1;
+        editor.last_offset_y = -1;
+        editor.last_cursor_x = -1;
+        editor.last_cursor_y = -1;
+    }
+    
+    editor.resize_pending = false;
 }
 
 void move_cursor(int dx, int dy) {
@@ -766,7 +831,8 @@ void insert_newline() {
 int main(int argc, char *argv[]) {
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
-    signal(SIGWINCH, handle_resize);
+    // Disable SIGWINCH handler for now - use polling instead
+    // signal(SIGWINCH, handle_resize);
     
     if (!terminal_init()) {
         fprintf(stderr, "Failed to initialize terminal\n");
@@ -804,10 +870,37 @@ int main(int argc, char *argv[]) {
     }
     
     while (1) {
+        // Check for window resize
+        int current_rows, current_cols;
+        current_rows = current_cols = 0;
+        terminal_get_window_size(&current_rows, &current_cols);
+        if (current_rows > 0 && current_cols > 0 && 
+            (current_rows != editor.screen_rows || current_cols != editor.screen_cols)) {
+            editor.resize_pending = true;
+        }
+        
+        process_resize();
         scroll_if_needed();
         draw_screen();
         
-        int c = terminal_read_key();
+        // Use select to check if input is available with timeout
+        fd_set readfds;
+        struct timeval timeout;
+        FD_ZERO(&readfds);
+        FD_SET(STDIN_FILENO, &readfds);
+        timeout.tv_sec = 0;
+        timeout.tv_usec = 50000; // 50ms timeout
+        
+        int activity = select(STDIN_FILENO + 1, &readfds, NULL, NULL, &timeout);
+        
+        int c = 0;
+        if (activity > 0 && FD_ISSET(STDIN_FILENO, &readfds)) {
+            // Input is available, read it
+            c = terminal_read_key();
+        } else {
+            // No input available, continue loop for resize checking
+            continue;
+        }
         
         // Debug: show key codes for any special keys
         if (c > 1000) {

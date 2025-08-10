@@ -21,6 +21,8 @@ A modern terminal-based text editor written in C23 with mouse support and famili
   - `Home`/`End` keys for line navigation
   - `Page Up`/`Page Down` for scrolling
 - **Text Selection**: Select text with mouse or keyboard (Shift+Arrow keys)
+- **Find Functionality**: Real-time search with Ctrl+F (Ctrl+N: next, Ctrl+P: prev)
+- **Window Resize**: Automatic handling of terminal window resizing
 - **Clipboard Integration**: Works with system clipboard (xclip/xsel/pbcopy)
 - **Status Messages**: Visual feedback for save operations and clipboard actions
 

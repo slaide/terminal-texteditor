@@ -46,6 +46,25 @@ The editor now includes comprehensive search functionality:
    - Found matches can be immediately copied or operated on
    - Status line shows search progress and controls
 
+### Window Resize Handling ✓
+
+The editor now properly handles terminal window resizing:
+
+1. **Non-blocking Input System** ✓
+   - Uses select() with timeout to avoid blocking on input
+   - Continuous resize detection even without keyboard input
+   - 50ms response time for resize events
+
+2. **Automatic Screen Adjustment** ✓
+   - Cursor position preserved during resize
+   - Scrolling boundaries recalculated
+   - Status line repositioned correctly
+
+3. **Responsive Layout** ✓
+   - Text content adapts to new window dimensions
+   - Line numbers and status bar adjust automatically
+   - No screen corruption during resize operations
+
 ## Next Steps
 
 Future improvements could include:
