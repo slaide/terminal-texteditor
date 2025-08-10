@@ -13,6 +13,7 @@ A modern terminal-based text editor written in C23 with mouse support and famili
   - `Ctrl+X` - Cut selected text  
   - `Ctrl+V` - Paste from clipboard
   - `Ctrl+A` - Select all text
+  - `Ctrl+F` - Find text with real-time search
   - `Ctrl+Q` - Quit editor
 - **Navigation**:
   - Arrow keys for cursor movement
@@ -54,6 +55,7 @@ For clipboard functionality, install one of:
 - **Ctrl+X**: Cut selection
 - **Ctrl+V**: Paste
 - **Ctrl+A**: Select all
+- **Ctrl+F**: Find text (Ctrl+N for next match, Esc to exit)
 - **Arrow Keys**: Move cursor
 - **Home/End**: Jump to line start/end
 - **Page Up/Down**: Scroll by page

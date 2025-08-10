@@ -31,6 +31,12 @@ typedef struct {
     int line_number_width;
     bool mouse_dragging;
     int mouse_drag_start_x, mouse_drag_start_y;
+    bool find_mode;
+    char *search_query;
+    int search_query_len;
+    int search_query_capacity;
+    int current_match;
+    int total_matches;
 } Editor;
 
 Editor editor = {0};
@@ -40,6 +46,7 @@ void cleanup_and_exit(int status) {
     if (editor.buffer) buffer_free(editor.buffer);
     if (editor.filename) free(editor.filename);
     if (editor.status_message) free(editor.status_message);
+    if (editor.search_query) free(editor.search_query);
     exit(status);
 }
 
@@ -342,13 +349,23 @@ void draw_status_line() {
     terminal_set_cursor_position(editor.screen_rows, 1);
     printf("\033[K\033[7m ");
     
-    time_t now = time(NULL);
-    if (editor.status_message && (now - editor.status_message_time < 3)) {
-        printf("%s", editor.status_message);
+    if (editor.find_mode) {
+        printf("Find: %s", editor.search_query ? editor.search_query : "");
+        if (editor.total_matches > 0) {
+            printf("  [%d/%d]", editor.current_match, editor.total_matches);
+        } else if (editor.search_query_len > 0) {
+            printf("  [no matches]");
+        }
+        printf("  (Ctrl+N: next, Esc: exit)");
     } else {
-        printf("%s%s",
-               editor.filename ? editor.filename : "untitled",
-               editor.modified ? " [modified]" : "");
+        time_t now = time(NULL);
+        if (editor.status_message && (now - editor.status_message_time < 3)) {
+            printf("%s", editor.status_message);
+        } else {
+            printf("%s%s",
+                   editor.filename ? editor.filename : "untitled",
+                   editor.modified ? " [modified]" : "");
+        }
     }
     
     printf(" \033[0m");
@@ -374,8 +391,13 @@ void draw_screen() {
         draw_status_line();
     }
     
-    // Show/hide cursor based on selection state
-    if (!editor.selecting) {
+    // Show/hide cursor based on mode and selection state
+    if (editor.find_mode) {
+        terminal_show_cursor();
+        // Position cursor at end of search query in status line
+        int cursor_col = 8 + editor.search_query_len;  // "Find: " + query length
+        terminal_set_cursor_position(editor.screen_rows, cursor_col);
+    } else if (!editor.selecting) {
         terminal_show_cursor();
         
         // Simple, direct cursor positioning
@@ -504,6 +526,105 @@ char *get_selected_text() {
     }
     
     return buffer_get_text_range(editor.buffer, start_y, start_x, end_y, end_x);
+}
+
+void enter_find_mode() {
+    editor.find_mode = true;
+    clear_selection();  // Clear any existing selection
+    if (!editor.search_query) {
+        editor.search_query_capacity = 256;
+        editor.search_query = malloc(editor.search_query_capacity);
+        editor.search_query[0] = '\0';
+    }
+    editor.search_query_len = 0;
+    editor.current_match = 0;
+    editor.total_matches = 0;
+    editor.needs_full_redraw = true;
+}
+
+void exit_find_mode() {
+    editor.find_mode = false;
+    editor.needs_full_redraw = true;
+}
+
+int find_matches() {
+    if (!editor.search_query || editor.search_query_len == 0) {
+        editor.total_matches = 0;
+        editor.current_match = 0;
+        return 0;
+    }
+    
+    int matches = 0;
+    int current_found = 0;
+    bool found_current = false;
+    
+    for (int y = 0; y < editor.buffer->line_count; y++) {
+        char *line = editor.buffer->lines[y];
+        if (!line) continue;
+        
+        char *pos = line;
+        while ((pos = strstr(pos, editor.search_query)) != NULL) {
+            matches++;
+            int x = pos - line;
+            
+            // Check if this is the closest match to current cursor position
+            if (!found_current && (y > editor.cursor_y || 
+                (y == editor.cursor_y && x >= editor.cursor_x))) {
+                current_found = matches;
+                found_current = true;
+            }
+            
+            pos++; // Move past this match to find next one
+        }
+    }
+    
+    editor.total_matches = matches;
+    editor.current_match = found_current ? current_found : (matches > 0 ? 1 : 0);
+    return matches;
+}
+
+void jump_to_match(int match_num) {
+    if (match_num < 1 || match_num > editor.total_matches) return;
+    
+    int found = 0;
+    for (int y = 0; y < editor.buffer->line_count; y++) {
+        char *line = editor.buffer->lines[y];
+        if (!line) continue;
+        
+        char *pos = line;
+        while ((pos = strstr(pos, editor.search_query)) != NULL) {
+            found++;
+            if (found == match_num) {
+                int x = pos - line;
+                
+                // Position cursor at start of match
+                editor.cursor_x = x;
+                editor.cursor_y = y;
+                
+                // Select the matched text
+                editor.select_start_x = x;
+                editor.select_start_y = y;
+                editor.select_end_x = x + editor.search_query_len;
+                editor.select_end_y = y;
+                editor.selecting = true;
+                
+                // Ensure cursor is visible
+                scroll_if_needed();
+                editor.current_match = match_num;
+                editor.needs_full_redraw = true;
+                return;
+            }
+            pos++;
+        }
+    }
+}
+
+void find_next() {
+    if (editor.total_matches == 0) return;
+    
+    int next = editor.current_match + 1;
+    if (next > editor.total_matches) next = 1; // Wrap around
+    jump_to_match(next);
 }
 
 void handle_mouse(int button, int x, int y, int pressed) {
@@ -685,7 +806,34 @@ int main(int argc, char *argv[]) {
             set_status_message("Key code: %d", c);
         }
         
-        if (c == CTRL_KEY('q')) {
+        if (editor.find_mode) {
+            if (c == 27) {  // Escape key
+                exit_find_mode();
+            } else if (c == CTRL_KEY('n')) {
+                find_next();
+            } else if (c == 127 || c == CTRL_KEY('h')) {  // Backspace
+                if (editor.search_query_len > 0) {
+                    editor.search_query_len--;
+                    editor.search_query[editor.search_query_len] = '\0';
+                    find_matches();
+                    if (editor.total_matches > 0) {
+                        jump_to_match(editor.current_match);
+                    }
+                }
+            } else if (c >= 32 && c < 127) {  // Printable characters
+                if (editor.search_query_len < editor.search_query_capacity - 1) {
+                    editor.search_query[editor.search_query_len] = c;
+                    editor.search_query_len++;
+                    editor.search_query[editor.search_query_len] = '\0';
+                    find_matches();
+                    if (editor.total_matches > 0) {
+                        jump_to_match(editor.current_match);
+                    }
+                }
+            }
+        } else if (c == CTRL_KEY('f')) {
+            enter_find_mode();
+        } else if (c == CTRL_KEY('q')) {
             break;
         } else if (c == CTRL_KEY('s')) {
             save_file();
