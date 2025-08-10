@@ -55,7 +55,7 @@ For clipboard functionality, install one of:
 - **Ctrl+X**: Cut selection
 - **Ctrl+V**: Paste
 - **Ctrl+A**: Select all
-- **Ctrl+F**: Find text (Ctrl+N for next match, Esc to exit)
+- **Ctrl+F**: Find text (Ctrl+N: next, Ctrl+P: previous, Esc to exit)
 - **Arrow Keys**: Move cursor
 - **Home/End**: Jump to line start/end
 - **Page Up/Down**: Scroll by page

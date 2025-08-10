@@ -356,7 +356,7 @@ void draw_status_line() {
         } else if (editor.search_query_len > 0) {
             printf("  [no matches]");
         }
-        printf("  (Ctrl+N: next, Esc: exit)");
+        printf("  (Ctrl+N: next, Ctrl+P: prev, Esc: exit)");
     } else {
         time_t now = time(NULL);
         if (editor.status_message && (now - editor.status_message_time < 3)) {
@@ -627,6 +627,14 @@ void find_next() {
     jump_to_match(next);
 }
 
+void find_previous() {
+    if (editor.total_matches == 0) return;
+    
+    int prev = editor.current_match - 1;
+    if (prev < 1) prev = editor.total_matches; // Wrap around
+    jump_to_match(prev);
+}
+
 void handle_mouse(int button, int x, int y, int pressed) {
     // Ignore clicks on line number area
     if (x <= editor.line_number_width) {
@@ -811,6 +819,8 @@ int main(int argc, char *argv[]) {
                 exit_find_mode();
             } else if (c == CTRL_KEY('n')) {
                 find_next();
+            } else if (c == CTRL_KEY('p')) {
+                find_previous();
             } else if (c == 127 || c == CTRL_KEY('h')) {  // Backspace
                 if (editor.search_query_len > 0) {
                     editor.search_query_len--;
