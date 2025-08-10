@@ -65,6 +65,27 @@ The editor now properly handles terminal window resizing:
    - Line numbers and status bar adjust automatically
    - No screen corruption during resize operations
 
+### Enhanced Status Bar ✓
+
+The status bar now provides comprehensive file information:
+
+1. **File Information Display** ✓
+   - Filename (or "untitled" for new files)
+   - Current line position and total line count (e.g., "Line 42/150")
+   - File size with smart formatting (bytes/KB/MB)
+   - Modification status indicator "[modified]"
+
+2. **Dynamic Updates** ✓
+   - Line numbers update in real-time as cursor moves
+   - File size recalculates when content changes
+   - Modification status tracks unsaved changes
+   - Temporary status messages still show for 3 seconds
+
+3. **Clean Display Format** ✓
+   - Compact layout: "filename  Line X/Y  size [modified]"
+   - Consistent with existing find mode and message display
+   - Removed debug key code display for cleaner interface
+
 ## Next Steps
 
 Future improvements could include:

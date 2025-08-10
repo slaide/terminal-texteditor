@@ -44,6 +44,10 @@ typedef struct {
 
 Editor editor = {0};
 
+// Function declarations
+int get_file_size(void);
+const char* format_file_size(int bytes);
+
 void cleanup_and_exit(int status) {
     terminal_cleanup();
     if (editor.buffer) buffer_free(editor.buffer);
@@ -427,13 +431,44 @@ void draw_status_line() {
         if (editor.status_message && (now - editor.status_message_time < 3)) {
             printf("%s", editor.status_message);
         } else {
-            printf("%s%s",
-                   editor.filename ? editor.filename : "untitled",
-                   editor.modified ? " [modified]" : "");
+            // Show comprehensive file information
+            const char* filename = editor.filename ? editor.filename : "untitled";
+            int current_line = editor.cursor_y + 1; // 1-based line numbers
+            int total_lines = editor.buffer->line_count;
+            int file_size = get_file_size();
+            const char* size_str = format_file_size(file_size);
+            const char* modified_str = editor.modified ? " [modified]" : "";
+            
+            printf("%s  Line %d/%d  %s%s", 
+                   filename, current_line, total_lines, size_str, modified_str);
         }
     }
     
     printf(" \033[0m");
+}
+
+int get_file_size() {
+    int size = 0;
+    for (int i = 0; i < editor.buffer->line_count; i++) {
+        if (editor.buffer->lines[i]) {
+            size += strlen(editor.buffer->lines[i]) + 1; // +1 for newline
+        } else {
+            size += 1; // empty line still has newline
+        }
+    }
+    return size;
+}
+
+const char* format_file_size(int bytes) {
+    static char size_str[32];
+    if (bytes < 1024) {
+        snprintf(size_str, sizeof(size_str), "%dB", bytes);
+    } else if (bytes < 1024 * 1024) {
+        snprintf(size_str, sizeof(size_str), "%.1fK", bytes / 1024.0);
+    } else {
+        snprintf(size_str, sizeof(size_str), "%.1fM", bytes / (1024.0 * 1024.0));
+    }
+    return size_str;
 }
 
 void draw_screen() {
@@ -902,10 +937,7 @@ int main(int argc, char *argv[]) {
             continue;
         }
         
-        // Debug: show key codes for any special keys
-        if (c > 1000) {
-            set_status_message("Key code: %d", c);
-        }
+        // Remove debug key codes - status bar now shows file info
         
         if (editor.find_mode) {
             if (c == 27) {  // Escape key
