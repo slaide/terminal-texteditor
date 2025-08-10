@@ -29,6 +29,8 @@ typedef struct {
     char *status_message;
     time_t status_message_time;
     int line_number_width;
+    bool mouse_dragging;
+    int mouse_drag_start_x, mouse_drag_start_y;
 } Editor;
 
 Editor editor = {0};
@@ -129,6 +131,39 @@ void scroll_if_needed() {
     int text_width = editor.screen_cols - editor.line_number_width;
     if (editor.cursor_x >= editor.offset_x + text_width) {
         editor.offset_x = editor.cursor_x - text_width + 1;
+    }
+}
+
+void auto_scroll_during_selection(int screen_y) {
+    bool scrolled = false;
+    
+    // Check if we need to scroll up (dragging above visible area)
+    if (screen_y <= 1 && editor.offset_y > 0) {
+        editor.offset_y--;
+        editor.cursor_y = editor.offset_y;
+        scrolled = true;
+    }
+    // Check if we need to scroll down (dragging below visible area)  
+    else if (screen_y >= editor.screen_rows - 1 && 
+             editor.offset_y + editor.screen_rows - 1 < editor.buffer->line_count - 1) {
+        editor.offset_y++;
+        editor.cursor_y = editor.offset_y + editor.screen_rows - 2;
+        scrolled = true;
+    }
+    
+    if (scrolled) {
+        // Ensure cursor is within buffer bounds
+        if (editor.cursor_y < 0) editor.cursor_y = 0;
+        if (editor.cursor_y >= editor.buffer->line_count) {
+            editor.cursor_y = editor.buffer->line_count - 1;
+        }
+        
+        // Adjust cursor x position to line length
+        int line_len = editor.buffer->lines[editor.cursor_y] ? 
+                       strlen(editor.buffer->lines[editor.cursor_y]) : 0;
+        if (editor.cursor_x > line_len) editor.cursor_x = line_len;
+        
+        editor.needs_full_redraw = true;
     }
 }
 
@@ -472,29 +507,70 @@ char *get_selected_text() {
 }
 
 void handle_mouse(int button, int x, int y, int pressed) {
-    if (button == 0 && pressed) {
-        if (x <= editor.line_number_width) {
-            return;
-        }
-        
-        editor.cursor_x = x - editor.line_number_width - 1 + editor.offset_x;
-        editor.cursor_y = y - 1 + editor.offset_y;
-        
-        if (editor.cursor_y >= editor.buffer->line_count) {
-            editor.cursor_y = editor.buffer->line_count - 1;
-        }
-        if (editor.cursor_y < 0) editor.cursor_y = 0;
-        
-        int line_len = editor.buffer->lines[editor.cursor_y] ? 
-                       strlen(editor.buffer->lines[editor.cursor_y]) : 0;
-        if (editor.cursor_x > line_len) editor.cursor_x = line_len;
-        if (editor.cursor_x < 0) editor.cursor_x = 0;
-        
-        if (button & 16) {
-            if (!editor.selecting) start_selection();
-            update_selection();
-        } else {
+    // Ignore clicks on line number area
+    if (x <= editor.line_number_width) {
+        return;
+    }
+    
+    if (button == 0) {  // Left mouse button
+        if (pressed) {
+            // Mouse button pressed - prepare for potential drag operation
+            int buffer_x = x - editor.line_number_width - 1 + editor.offset_x;
+            int buffer_y = y - 1 + editor.offset_y;
+            
+            // Clamp coordinates to valid buffer range
+            if (buffer_y >= editor.buffer->line_count) {
+                buffer_y = editor.buffer->line_count - 1;
+            }
+            if (buffer_y < 0) buffer_y = 0;
+            
+            int line_len = editor.buffer->lines[buffer_y] ? 
+                           strlen(editor.buffer->lines[buffer_y]) : 0;
+            if (buffer_x > line_len) buffer_x = line_len;
+            if (buffer_x < 0) buffer_x = 0;
+            
+            editor.cursor_x = buffer_x;
+            editor.cursor_y = buffer_y;
+            editor.mouse_dragging = true;
+            editor.mouse_drag_start_x = buffer_x;
+            editor.mouse_drag_start_y = buffer_y;
+            
+            // Clear any existing selection on click
             clear_selection();
+        } else {
+            // Mouse button released - end drag operation
+            if (editor.mouse_dragging) {
+                editor.mouse_dragging = false;
+            }
+        }
+    } else if (button == 32) {  // Mouse drag event (button held and moving)
+        if (editor.mouse_dragging) {
+            // Check for auto-scroll first
+            auto_scroll_during_selection(y);
+            
+            // Convert screen coordinates to buffer coordinates
+            int buffer_x = x - editor.line_number_width - 1 + editor.offset_x;
+            int buffer_y = y - 1 + editor.offset_y;
+            
+            // Clamp coordinates to valid buffer range
+            if (buffer_y >= editor.buffer->line_count) {
+                buffer_y = editor.buffer->line_count - 1;
+            }
+            if (buffer_y < 0) buffer_y = 0;
+            
+            int line_len = editor.buffer->lines[buffer_y] ? 
+                           strlen(editor.buffer->lines[buffer_y]) : 0;
+            if (buffer_x > line_len) buffer_x = line_len;
+            if (buffer_x < 0) buffer_x = 0;
+            
+            // Start selection on first drag movement
+            if (!editor.selecting) {
+                start_selection();
+            }
+            
+            editor.cursor_x = buffer_x;
+            editor.cursor_y = buffer_y;
+            update_selection();
         }
     }
 }

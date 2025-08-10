@@ -6,7 +6,7 @@ A modern terminal-based text editor written in C23 with mouse support and famili
 
 - **File Operations**: Open, edit, and save files
 - **Line Numbers**: 6-digit padded line numbers with syntax highlighting
-- **Mouse Support**: Click to position cursor, drag to select text
+- **Mouse Support**: Click to position cursor, drag to select text with auto-scroll
 - **Modern Shortcuts**: 
   - `Ctrl+S` - Save file
   - `Ctrl+C` - Copy selected text
@@ -57,7 +57,7 @@ For clipboard functionality, install one of:
 - **Arrow Keys**: Move cursor
 - **Home/End**: Jump to line start/end
 - **Page Up/Down**: Scroll by page
-- **Mouse**: Click to position cursor
+- **Mouse**: Click to position cursor, drag to select text
 - **Ctrl+Left/Right**: Jump by words
 - **Shift+Arrow**: Select text
 - **Shift+Ctrl+Arrow**: Select by words

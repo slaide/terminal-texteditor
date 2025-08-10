@@ -32,6 +32,7 @@ bool terminal_init(void) {
 }
 
 void terminal_cleanup(void) {
+    terminal_disable_mouse();
     printf("\033[?25h\033[?1049l");  // Show cursor before exiting
     fflush(stdout);
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
@@ -104,7 +105,18 @@ int terminal_read_key(void) {
                     int y = mouse[2] - 32;
                     
                     extern void handle_mouse(int button, int x, int y, int pressed);
-                    handle_mouse(button & 3, x, y, !(button & 32));
+                    
+                    // Simple mouse event handling
+                    if ((button & 32) == 0) {
+                        // Button press
+                        handle_mouse(button & 3, x, y, 1);
+                    } else if ((button & 3) == 3) {
+                        // Button release (no button active)
+                        handle_mouse(0, x, y, 0);
+                    } else if (button & 32) {
+                        // Drag/motion with button held
+                        handle_mouse(32, x, y, 1);
+                    }
                 }
                 return 0;
             } else {
@@ -185,12 +197,12 @@ void terminal_get_window_size(int *rows, int *cols) {
 }
 
 void terminal_enable_mouse(void) {
-    printf("\033[?1000h\033[?1002h\033[?1015h\033[?1006h");
+    printf("\033[?1000h\033[?1002h");  // Enable basic mouse + button motion
     fflush(stdout);
 }
 
 void terminal_disable_mouse(void) {
-    printf("\033[?1006l\033[?1015l\033[?1002l\033[?1000l");
+    printf("\033[?1002l\033[?1000l");  // Disable in reverse order
     fflush(stdout);
 }
 
