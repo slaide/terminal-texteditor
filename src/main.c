@@ -485,11 +485,11 @@ void move_cursor_word_left() {
     }
 }
 
-void draw_line(int screen_y, int file_y) {
+void draw_line(int screen_y, int file_y, int start_col) {
     Tab* tab = get_current_tab();
     if (!tab) return;
     
-    terminal_set_cursor_position(screen_y + 2, 1);
+    terminal_set_cursor_position(screen_y + 2, start_col);
     printf("\033[K");
     
     if (file_y < tab->buffer->line_count) {
@@ -757,7 +757,7 @@ void draw_screen() {
             if (editor.file_manager_visible && !editor.file_manager_overlay_mode) {
                 terminal_set_cursor_position(y + 2, text_start_col);
             }
-            draw_line(y, file_y);
+            draw_line(y, file_y, text_start_col);
         }
         
         draw_status_line();
@@ -786,7 +786,7 @@ void draw_screen() {
     } else if (!tab->selecting) {
         terminal_show_cursor();
         
-        // Calculate cursor position accounting for file manager
+        // Calculate text area starting column (same logic as in draw_screen)
         int text_start_col = 1;
         if (editor.file_manager_visible && !editor.file_manager_overlay_mode) {
             text_start_col += editor.file_manager_width + 1; // +1 for border
@@ -1149,7 +1149,12 @@ void insert_char(char c) {
     tab->cursor_x++;
     tab->modified = true;
     
-    draw_line(tab->cursor_y - tab->offset_y, tab->cursor_y);
+    // Calculate text start column for consistent drawing
+    int text_start_col = 1;
+    if (editor.file_manager_visible && !editor.file_manager_overlay_mode) {
+        text_start_col += editor.file_manager_width + 1;
+    }
+    draw_line(tab->cursor_y - tab->offset_y, tab->cursor_y, text_start_col);
 }
 
 void delete_char() {
@@ -1161,7 +1166,12 @@ void delete_char() {
         tab->cursor_x--;
         tab->modified = true;
         
-        draw_line(tab->cursor_y - tab->offset_y, tab->cursor_y);
+        // Calculate text start column for consistent drawing
+        int text_start_col = 1;
+        if (editor.file_manager_visible && !editor.file_manager_overlay_mode) {
+            text_start_col += editor.file_manager_width + 1;
+        }
+        draw_line(tab->cursor_y - tab->offset_y, tab->cursor_y, text_start_col);
     } else if (tab->cursor_y > 0) {
         int prev_line_len = tab->buffer->lines[tab->cursor_y - 1] ? 
                            strlen(tab->buffer->lines[tab->cursor_y - 1]) : 0;
