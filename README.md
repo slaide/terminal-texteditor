@@ -1,9 +1,10 @@
 # Terminal Text Editor
 
-A modern terminal-based text editor written in C23 with mouse support and familiar keyboard shortcuts.
+A modern terminal-based text editor written in C23 with **multi-tab support**, mouse support, and familiar keyboard shortcuts.
 
 ## Features
 
+- **Multi-Tab Support**: Work with unlimited tabs, visual tab bar with current tab indicators
 - **File Operations**: Open, edit, and save files
 - **Line Numbers**: 6-digit padded line numbers with syntax highlighting
 - **Mouse Support**: Click to position cursor, drag to select text with auto-scroll
@@ -14,6 +15,10 @@ A modern terminal-based text editor written in C23 with mouse support and famili
   - `Ctrl+V` - Paste from clipboard
   - `Ctrl+A` - Select all text
   - `Ctrl+F` - Find text with real-time search
+  - `Ctrl+T` - Create new tab
+  - `Ctrl+O` - Open file in new tab
+  - `Ctrl+W` - Close current tab
+  - `Ctrl+[`/`Ctrl+]` - Switch between tabs
   - `Ctrl+Q` - Quit editor
 - **Navigation**:
   - Arrow keys for cursor movement
@@ -23,6 +28,7 @@ A modern terminal-based text editor written in C23 with mouse support and famili
 - **Text Selection**: Select text with mouse or keyboard (Shift+Arrow keys)
 - **Find Functionality**: Real-time search with Ctrl+F (Ctrl+N: next, Ctrl+P: prev)
 - **Window Resize**: Automatic handling of terminal window resizing
+- **Tab Bar**: Visual tab bar showing all open tabs with current tab indicator (`>tab<`)
 - **Status Bar**: Shows filename, current line/total lines, file size, and modification status
 - **Clipboard Integration**: Works with system clipboard (xclip/xsel/pbcopy)
 - **Status Messages**: Visual feedback for save operations and clipboard actions
@@ -39,8 +45,12 @@ make
 # Open a file
 ./texteditor filename.txt
 
-# Create a new file
+# Create a new file (starts with empty tab)
 ./texteditor
+
+# Open multiple files in tabs
+./texteditor file1.txt
+# Then use Ctrl+O to open more files in new tabs
 ```
 
 ## Dependencies
@@ -52,22 +62,49 @@ For clipboard functionality, install one of:
 
 ## Controls
 
-- **Ctrl+Q**: Quit
-- **Ctrl+S**: Save file
+### Tab Management
+- **Ctrl+T**: Create new empty tab
+- **Ctrl+O**: Open file in new tab (prompts for filename in status line)
+- **Ctrl+W**: Close current tab (cannot close last tab)
+- **Ctrl+[**: Switch to previous tab
+- **Ctrl+]**: Switch to next tab
+
+### File Operations
+- **Ctrl+S**: Save current tab's file
+- **Ctrl+Q**: Quit editor
+
+### Text Operations
 - **Ctrl+C**: Copy selection
 - **Ctrl+X**: Cut selection
 - **Ctrl+V**: Paste
-- **Ctrl+A**: Select all
+- **Ctrl+A**: Select all text in current tab
 - **Ctrl+F**: Find text (Ctrl+N: next, Ctrl+P: previous, Esc to exit)
+
+### Navigation
 - **Arrow Keys**: Move cursor
 - **Home/End**: Jump to line start/end
 - **Page Up/Down**: Scroll by page
-- **Mouse**: Click to position cursor, drag to select text
 - **Ctrl+Left/Right**: Jump by words
 - **Shift+Arrow**: Select text
 - **Shift+Ctrl+Arrow**: Select by words
 
+### Mouse Support
+- **Click**: Position cursor
+- **Drag**: Select text with auto-scroll
+
 The editor supports standard text editing operations including inserting characters, deleting with backspace, and creating new lines with Enter.
+
+## Multi-Tab Interface
+
+The editor features a visual tab bar at the top of the screen:
+```
+ 1:file1.txt  >2:file2.txt*<  3:untitled  4:readme.md 
+```
+
+- **Current tab**: Highlighted with `>` and `<` brackets plus different background color
+- **Modified files**: Show asterisk `*` next to filename  
+- **Tab numbers**: Easy reference for navigation
+- **Per-tab state**: Each tab maintains its own cursor position, selection, and scroll offset
 
 ## Architecture
 
@@ -75,7 +112,7 @@ The editor is modular with separate components for:
 - `terminal.c/h` - Terminal I/O and raw mode handling
 - `buffer.c/h` - Text buffer management and file operations
 - `clipboard.c/h` - System clipboard integration
-- `main.c` - Editor logic and user interface
+- `main.c` - Editor logic, user interface, and multi-tab management
 
 Built using C23 standard with POSIX compliance for cross-platform compatibility.
 
