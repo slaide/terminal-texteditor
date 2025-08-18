@@ -5,6 +5,7 @@ A modern terminal-based text editor written in C23 with **multi-tab support**, m
 ## Features
 
 - **Multi-Tab Support**: Work with unlimited tabs, visual tab bar with current tab indicators
+- **File Manager**: Built-in sidebar for browsing files and directories
 - **File Operations**: Open, edit, and save files
 - **Line Numbers**: 6-digit padded line numbers with syntax highlighting
 - **Mouse Support**: Click to position cursor, drag to select text with auto-scroll
@@ -19,6 +20,7 @@ A modern terminal-based text editor written in C23 with **multi-tab support**, m
   - `Ctrl+O` - Open file in new tab
   - `Ctrl+W` - Close current tab
   - `Ctrl+[`/`Ctrl+]` - Switch between tabs
+  - `Ctrl+E` - Toggle file manager sidebar
   - `Ctrl+Q` - Quit editor
 - **Navigation**:
   - Arrow keys for cursor movement
@@ -30,6 +32,7 @@ A modern terminal-based text editor written in C23 with **multi-tab support**, m
 - **Window Resize**: Automatic handling of terminal window resizing
 - **Tab Bar**: Visual tab bar showing all open tabs with current tab indicator (`>tab<`)
 - **Status Bar**: Shows filename, current line/total lines, file size, and modification status
+- **File Manager**: Sidebar for file browsing with directory navigation and file operations
 - **Clipboard Integration**: Works with system clipboard (xclip/xsel/pbcopy)
 - **Status Messages**: Visual feedback for save operations and clipboard actions
 
@@ -68,6 +71,13 @@ For clipboard functionality, install one of:
 - **Ctrl+W**: Close current tab (cannot close last tab)
 - **Ctrl+[**: Switch to previous tab
 - **Ctrl+]**: Switch to next tab
+
+### File Manager
+- **Ctrl+E**: Toggle file manager sidebar on/off
+- **Tab**: Switch focus between file manager and text editor (when file manager is open)
+- **↑/↓**: Navigate files and directories (when file manager is focused)
+- **Enter**: Open selected file in new tab OR enter selected directory
+- **Esc**: Return focus to text editor
 
 ### File Operations
 - **Ctrl+S**: Save current tab's file
@@ -115,6 +125,19 @@ The editor is modular with separate components for:
 - `main.c` - Editor logic, user interface, and multi-tab management
 
 Built using C23 standard with POSIX compliance for cross-platform compatibility.
+
+## File Manager
+
+The built-in file manager provides seamless file browsing and navigation:
+
+- **Sidebar display**: Shows files with sizes (e.g., `1.2K`) and directories marked as `<DIR>`
+- **Directory navigation**: Use Enter to open directories, `..` to go up one level
+- **File operations**: Enter on files opens them in new tabs
+- **Focus management**: Tab key switches between file manager and text editor
+- **Visual feedback**: Different background colors indicate focus state
+- **Responsive layout**: Tab bar and text area adjust when file manager is visible
+
+For detailed usage instructions, see [FILE_MANAGER_USAGE.md](FILE_MANAGER_USAGE.md).
 
 ## Development
 

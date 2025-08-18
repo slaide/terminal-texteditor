@@ -568,10 +568,35 @@ void draw_line(int screen_y, int file_y, int start_col) {
 }
 
 void draw_tab_bar() {
-    terminal_set_cursor_position(1, 1);
+    // Draw "File Browser" label in top-left if file manager is visible
+    if (editor.file_manager_visible && !editor.file_manager_overlay_mode) {
+        terminal_set_cursor_position(1, 1);
+        if (editor.file_manager_focused) {
+            printf("\033[44m\033[1m"); // Blue background, bold when focused
+        } else {
+            printf("\033[100m\033[1m"); // Dark gray background, bold when not focused
+        }
+        printf(" File Browser ");
+        // Fill remaining width of file manager area
+        for (int x = 14; x <= editor.file_manager_width; x++) {
+            printf(" ");
+        }
+        printf("\033[0m"); // Reset formatting
+    }
+    
+    // Calculate tab bar position and width
+    int tab_start_col = 1;
+    int tab_width = editor.screen_cols;
+    
+    if (editor.file_manager_visible && !editor.file_manager_overlay_mode) {
+        tab_start_col += editor.file_manager_width + 1; // Start after file manager
+        tab_width -= editor.file_manager_width + 1;     // Reduce width
+    }
+    
+    terminal_set_cursor_position(1, tab_start_col);
     printf("\033[K\033[7m"); // Clear line and reverse video
     
-    int col = 1;
+    int col = tab_start_col;
     for (int i = 0; i < editor.tab_count; i++) {
         Tab* tab = &editor.tabs[i];
         const char* filename = tab->filename ? tab->filename : "untitled";
@@ -596,7 +621,7 @@ void draw_tab_bar() {
             col += strlen(basename) + (tab->modified ? 6 : 5); // Account for number, colon, spaces, and optional *
         }
         
-        if (col >= editor.screen_cols - 10) {
+        if (col >= tab_start_col + tab_width - 10) {
             printf("...");
             break;
         }
@@ -1374,7 +1399,7 @@ void draw_file_manager(void) {
     
     int start_col = 1;
     int width = editor.file_manager_width;
-    int visible_height = editor.screen_rows - 3; // Account for tab bar and status line
+    int visible_height = editor.screen_rows - 2; // Account for tab bar and status line
     
     // Draw file manager background and border
     for (int y = 0; y < visible_height; y++) {
@@ -1519,6 +1544,9 @@ int main(int argc, char *argv[]) {
             if (c == 27) {  // Escape key
                 editor.file_manager_focused = false;
                 // Focus change doesn't need full screen redraw
+            } else if (c == CTRL_KEY('q')) {
+                // Allow Ctrl+Q to quit even when file manager is focused
+                break;
             } else if (c == CTRL_KEY('e')) {
                 // Allow Ctrl+E to toggle file manager even when focused
                 toggle_file_manager();
