@@ -67,6 +67,9 @@ typedef struct {
     int file_manager_cursor;
     int file_manager_offset;
     bool file_manager_focused;
+    
+    // Quit confirmation dialog state
+    bool quit_confirmation_active;
 } Editor;
 
 Editor editor = {0};
@@ -95,6 +98,9 @@ void file_manager_select_item(void);
 void free_file_list(void);
 const char* get_file_size_str(const char* filepath);
 bool is_directory(const char* filepath);
+bool has_unsaved_changes(void);
+void show_quit_confirmation(void);
+void draw_quit_confirmation(void);
 
 Tab* get_current_tab(void) {
     if (editor.current_tab >= 0 && editor.current_tab < editor.tab_count) {
@@ -797,6 +803,9 @@ void draw_screen() {
         draw_status_line();
     }
     
+    // Draw quit confirmation dialog if active (overlay on top of everything)
+    draw_quit_confirmation();
+    
     // Show/hide cursor based on mode and selection state
     if (editor.find_mode) {
         terminal_show_cursor();
@@ -1229,6 +1238,118 @@ bool is_directory(const char* filepath) {
     return S_ISDIR(statbuf.st_mode);
 }
 
+bool has_unsaved_changes(void) {
+    for (int i = 0; i < editor.tab_count; i++) {
+        if (editor.tabs[i].modified) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void show_quit_confirmation(void) {
+    editor.quit_confirmation_active = true;
+    editor.needs_full_redraw = true;
+}
+
+void draw_quit_confirmation(void) {
+    if (!editor.quit_confirmation_active) return;
+    
+    // Calculate dialog dimensions based on terminal size
+    int min_width = 40;  // Minimum dialog width
+    int max_width = editor.screen_cols - 4;  // Leave 2 chars margin on each side
+    int dialog_width = min_width;
+    
+    // Adjust width based on terminal size
+    if (max_width < min_width) {
+        dialog_width = max_width;  // Use full width minus margins for very narrow terminals
+    } else if (max_width >= 60) {
+        dialog_width = 55;  // Use preferred width for wider terminals
+    } else {
+        dialog_width = max_width;  // Use available width for medium terminals
+    }
+    
+    int dialog_height = 5;
+    int start_row = (editor.screen_rows - dialog_height) / 2;
+    int start_col = (editor.screen_cols - dialog_width) / 2;
+    
+    // Ensure dialog fits on screen
+    if (start_col < 1) start_col = 1;
+    if (start_row < 1) start_row = 1;
+    if (start_row + dialog_height > editor.screen_rows) {
+        start_row = editor.screen_rows - dialog_height;
+    }
+    
+    // Draw dialog background
+    for (int y = 0; y < dialog_height; y++) {
+        terminal_set_cursor_position(start_row + y, start_col);
+        printf("\033[41m\033[37m"); // Red background, white text
+        for (int x = 0; x < dialog_width; x++) {
+            printf(" ");
+        }
+    }
+    
+    // Draw dialog content with calculated text wrapping
+    const char* title = "You have unsaved changes!";
+    const char* message = "Press 'q' to quit anyway, or any other key to cancel";
+    
+    int available_width = dialog_width - 4;  // Account for 2-char padding on each side
+    
+    // Draw title (line 1)
+    terminal_set_cursor_position(start_row + 1, start_col + 2);
+    printf("\033[41m\033[1m\033[37m"); // Red background, bold white text
+    
+    if ((int)strlen(title) <= available_width) {
+        printf("%s", title);
+    } else {
+        printf("%.*s", available_width, title); // Truncate to fit
+    }
+    
+    // Draw message with proper line wrapping (line 2-3)
+    terminal_set_cursor_position(start_row + 2, start_col + 2);
+    printf("\033[41m\033[0m\033[37m"); // Red background, normal white text
+    
+    int message_len = strlen(message);
+    if (message_len <= available_width) {
+        // Message fits on one line
+        printf("%s", message);
+    } else {
+        // Need to wrap - find best break point within available width
+        int break_pos = available_width;
+        
+        // Look for space to break on (work backwards from available_width)
+        for (int i = available_width - 1; i > available_width / 2; i--) {
+            if (i < message_len && message[i] == ' ') {
+                break_pos = i;
+                break;
+            }
+        }
+        
+        // Print first line
+        printf("%.*s", break_pos, message);
+        
+        // Print second line (skip the space if we broke on one)
+        int second_line_start = break_pos;
+        if (second_line_start < message_len && message[second_line_start] == ' ') {
+            second_line_start++;
+        }
+        
+        if (second_line_start < message_len) {
+            terminal_set_cursor_position(start_row + 3, start_col + 2);
+            printf("\033[41m\033[0m\033[37m");
+            
+            int remaining_chars = message_len - second_line_start;
+            if (remaining_chars <= available_width) {
+                printf("%s", message + second_line_start);
+            } else {
+                printf("%.*s", available_width, message + second_line_start);
+            }
+        }
+    }
+    
+    printf("\033[0m"); // Reset formatting
+}
+
 const char* get_file_size_str(const char* filepath) {
     static char size_str[32];
     struct stat statbuf;
@@ -1539,14 +1660,29 @@ int main(int argc, char *argv[]) {
         
         // Remove debug key codes - status bar now shows file info
         
+        // Handle quit confirmation dialog first (highest priority when active)
+        if (editor.quit_confirmation_active) {
+            if (c == 'q' || c == 'Q') {
+                // User confirmed quit
+                break;
+            } else {
+                // User cancelled quit
+                editor.quit_confirmation_active = false;
+                editor.needs_full_redraw = true;
+            }
+        
         // Handle file manager input first (highest priority when focused)
-        if (editor.file_manager_visible && editor.file_manager_focused) {
+        } else if (editor.file_manager_visible && editor.file_manager_focused) {
             if (c == 27) {  // Escape key
                 editor.file_manager_focused = false;
                 // Focus change doesn't need full screen redraw
             } else if (c == CTRL_KEY('q')) {
                 // Allow Ctrl+Q to quit even when file manager is focused
-                break;
+                if (has_unsaved_changes()) {
+                    show_quit_confirmation();
+                } else {
+                    break;
+                }
             } else if (c == CTRL_KEY('e')) {
                 // Allow Ctrl+E to toggle file manager even when focused
                 toggle_file_manager();
@@ -1646,7 +1782,11 @@ int main(int argc, char *argv[]) {
             // Ctrl+] - Next tab
             switch_to_next_tab();
         } else if (c == CTRL_KEY('q')) {
-            break;
+            if (has_unsaved_changes()) {
+                show_quit_confirmation();
+            } else {
+                break;
+            }
         } else if (c == CTRL_KEY('s')) {
             save_file();
         } else if (c == CTRL_KEY('c')) {
