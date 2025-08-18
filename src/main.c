@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -101,6 +102,7 @@ bool is_directory(const char* filepath);
 bool has_unsaved_changes(void);
 void show_quit_confirmation(void);
 void draw_quit_confirmation(void);
+int find_tab_with_file(const char* filename);
 
 Tab* get_current_tab(void) {
     if (editor.current_tab >= 0 && editor.current_tab < editor.tab_count) {
@@ -670,12 +672,22 @@ void exit_filename_input_mode(void) {
 void process_filename_input(void) {
     if (editor.filename_input_len > 0) {
         editor.filename_input[editor.filename_input_len] = '\0';
-        int new_tab = create_new_tab(editor.filename_input);
-        if (new_tab >= 0) {
-            switch_to_tab(new_tab);
-            set_status_message("Opened %s in tab %d", editor.filename_input, new_tab + 1);
+        
+        // Check if file is already open in a tab
+        int existing_tab = find_tab_with_file(editor.filename_input);
+        if (existing_tab >= 0) {
+            // File is already open, switch to that tab
+            switch_to_tab(existing_tab);
+            set_status_message("Switched to existing tab %d (%s)", existing_tab + 1, editor.filename_input);
         } else {
-            set_status_message("Error: Could not open file %s", editor.filename_input);
+            // File not open, create new tab
+            int new_tab = create_new_tab(editor.filename_input);
+            if (new_tab >= 0) {
+                switch_to_tab(new_tab);
+                set_status_message("Opened %s in tab %d", editor.filename_input, new_tab + 1);
+            } else {
+                set_status_message("Error: Could not open file %s", editor.filename_input);
+            }
         }
     }
     exit_filename_input_mode();
@@ -1247,6 +1259,46 @@ bool has_unsaved_changes(void) {
     return false;
 }
 
+int find_tab_with_file(const char* filename) {
+    if (!filename) return -1;
+    
+    // Resolve the input filename to absolute path
+    char *abs_path = realpath(filename, NULL);
+    if (!abs_path) {
+        // If realpath fails (file doesn't exist yet), fall back to simple comparison
+        for (int i = 0; i < editor.tab_count; i++) {
+            if (editor.tabs[i].filename && strcmp(filename, editor.tabs[i].filename) == 0) {
+                return i;
+            }
+        }
+        return -1;
+    }
+    
+    // Compare with absolute paths of all open tabs
+    for (int i = 0; i < editor.tab_count; i++) {
+        if (editor.tabs[i].filename) {
+            char *tab_abs_path = realpath(editor.tabs[i].filename, NULL);
+            if (tab_abs_path) {
+                bool match = (strcmp(abs_path, tab_abs_path) == 0);
+                free(tab_abs_path);
+                if (match) {
+                    free(abs_path);
+                    return i;
+                }
+            } else {
+                // If realpath fails for tab filename, compare with original paths
+                if (strcmp(filename, editor.tabs[i].filename) == 0) {
+                    free(abs_path);
+                    return i;
+                }
+            }
+        }
+    }
+    
+    free(abs_path);
+    return -1; // Not found
+}
+
 void show_quit_confirmation(void) {
     editor.quit_confirmation_active = true;
     editor.needs_full_redraw = true;
@@ -1501,14 +1553,23 @@ void file_manager_select_item(void) {
         }
         refresh_file_list();
     } else {
-        // Open file in new tab
-        int new_tab = create_new_tab(full_path);
-        if (new_tab >= 0) {
-            switch_to_tab(new_tab);
-            set_status_message("Opened %s", selected);
+        // Check if file is already open in a tab
+        int existing_tab = find_tab_with_file(full_path);
+        if (existing_tab >= 0) {
+            // File is already open, switch to that tab
+            switch_to_tab(existing_tab);
+            set_status_message("Switched to existing tab %d (%s)", existing_tab + 1, selected);
             editor.file_manager_focused = false; // Return focus to editor
         } else {
-            set_status_message("Error: Could not open %s", selected);
+            // Open file in new tab
+            int new_tab = create_new_tab(full_path);
+            if (new_tab >= 0) {
+                switch_to_tab(new_tab);
+                set_status_message("Opened %s", selected);
+                editor.file_manager_focused = false; // Return focus to editor
+            } else {
+                set_status_message("Error: Could not open %s", selected);
+            }
         }
     }
     
