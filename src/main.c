@@ -12,6 +12,8 @@
 #include <sys/select.h>
 #include <unistd.h>
 #include <stdbool.h>
+#include <dirent.h>
+#include <sys/stat.h>
 #include "terminal.h"
 #include "buffer.h"
 #include "clipboard.h"
@@ -53,6 +55,18 @@ typedef struct {
     int filename_input_len;
     int filename_input_capacity;
     volatile bool resize_pending;
+    
+    // File manager state
+    bool file_manager_visible;
+    bool file_manager_overlay_mode; // true = overlay, false = reduce text width
+    int file_manager_width;
+    char *current_directory;
+    char **file_list;
+    int file_count;
+    int file_capacity;
+    int file_manager_cursor;
+    int file_manager_offset;
+    bool file_manager_focused;
 } Editor;
 
 Editor editor = {0};
@@ -73,6 +87,14 @@ void enter_filename_input_mode(void);
 void exit_filename_input_mode(void);
 void process_filename_input(void);
 void clear_selection(void);
+void toggle_file_manager(void);
+void refresh_file_list(void);
+void draw_file_manager(void);
+void file_manager_navigate(int direction);
+void file_manager_select_item(void);
+void free_file_list(void);
+const char* get_file_size_str(const char* filepath);
+bool is_directory(const char* filepath);
 
 Tab* get_current_tab(void) {
     if (editor.current_tab >= 0 && editor.current_tab < editor.tab_count) {
@@ -164,6 +186,8 @@ void cleanup_and_exit(int status) {
     if (editor.status_message) free(editor.status_message);
     if (editor.search_query) free(editor.search_query);
     if (editor.filename_input) free(editor.filename_input);
+    if (editor.current_directory) free(editor.current_directory);
+    free_file_list();
     exit(status);
 }
 
@@ -657,8 +681,13 @@ void draw_status_line() {
             const char* size_str = format_file_size(file_size);
             const char* modified_str = tab->modified ? " [modified]" : "";
             
-            printf("%s  Line %d/%d  %s%s", 
-                   filename, current_line, total_lines, size_str, modified_str);
+            if (editor.file_manager_visible && editor.file_manager_focused) {
+                printf("%s  Line %d/%d  %s%s  [FILE MANAGER FOCUSED - Tab to switch]", 
+                       filename, current_line, total_lines, size_str, modified_str);
+            } else {
+                printf("%s  Line %d/%d  %s%s", 
+                       filename, current_line, total_lines, size_str, modified_str);
+            }
         }
     }
     
@@ -705,9 +734,27 @@ void draw_screen() {
         // Draw tab bar
         draw_tab_bar();
         
+        // Draw file manager if visible
+        if (editor.file_manager_visible) {
+            draw_file_manager();
+        }
+        
+        // Calculate text area position and width
+        int text_start_col = 1;
+        int text_width = editor.screen_cols;
+        
+        if (editor.file_manager_visible && !editor.file_manager_overlay_mode) {
+            text_start_col += editor.file_manager_width + 1; // +1 for border
+            text_width -= editor.file_manager_width + 1;
+        }
+        
         // Draw content (screen_rows - 2 to account for tab bar and status line)
         for (int y = 0; y < editor.screen_rows - 2; y++) {
             int file_y = y + tab->offset_y;
+            // Temporarily adjust draw_line to handle file manager offset
+            if (editor.file_manager_visible && !editor.file_manager_overlay_mode) {
+                terminal_set_cursor_position(y + 2, text_start_col);
+            }
             draw_line(y, file_y);
         }
         
@@ -717,6 +764,9 @@ void draw_screen() {
         tab->last_offset_y = tab->offset_y;
     } else {
         draw_tab_bar();
+        if (editor.file_manager_visible) {
+            draw_file_manager();
+        }
         draw_status_line();
     }
     
@@ -734,14 +784,20 @@ void draw_screen() {
     } else if (!tab->selecting) {
         terminal_show_cursor();
         
-        // Simple, direct cursor positioning (adjust for tab bar)
+        // Calculate cursor position accounting for file manager
+        int text_start_col = 1;
+        if (editor.file_manager_visible && !editor.file_manager_overlay_mode) {
+            text_start_col += editor.file_manager_width + 1; // +1 for border
+        }
+        
+        // Simple, direct cursor positioning (adjust for tab bar and file manager)
         int screen_row = (tab->cursor_y - tab->offset_y) + 2;  // +2 for tab bar
-        int screen_col = (tab->cursor_x - tab->offset_x) + 8;  // 7 for line numbers + 1 space
+        int screen_col = (tab->cursor_x - tab->offset_x) + text_start_col + 7;  // 7 for line numbers
         
         // Make sure we're in the valid text area
         if (screen_row < 2) screen_row = 2;  // Account for tab bar
         if (screen_row >= editor.screen_rows) screen_row = editor.screen_rows - 1;
-        if (screen_col < 8) screen_col = 8;
+        if (screen_col < text_start_col + 7) screen_col = text_start_col + 7;
         
         terminal_set_cursor_position(screen_row, screen_col);
     } else {
@@ -1128,6 +1184,232 @@ void insert_newline() {
     editor.needs_full_redraw = true;
 }
 
+bool is_directory(const char* filepath) {
+    struct stat statbuf;
+    if (stat(filepath, &statbuf) != 0) {
+        return false;
+    }
+    return S_ISDIR(statbuf.st_mode);
+}
+
+const char* get_file_size_str(const char* filepath) {
+    static char size_str[32];
+    struct stat statbuf;
+    
+    if (stat(filepath, &statbuf) != 0) {
+        return "---";
+    }
+    
+    if (S_ISDIR(statbuf.st_mode)) {
+        return "<DIR>";
+    }
+    
+    long size = statbuf.st_size;
+    if (size < 1024) {
+        snprintf(size_str, sizeof(size_str), "%ldB", size);
+    } else if (size < 1024 * 1024) {
+        snprintf(size_str, sizeof(size_str), "%.1fK", size / 1024.0);
+    } else {
+        snprintf(size_str, sizeof(size_str), "%.1fM", size / (1024.0 * 1024.0));
+    }
+    return size_str;
+}
+
+void free_file_list(void) {
+    if (editor.file_list) {
+        for (int i = 0; i < editor.file_count; i++) {
+            if (editor.file_list[i]) {
+                free(editor.file_list[i]);
+            }
+        }
+        free(editor.file_list);
+        editor.file_list = NULL;
+    }
+    editor.file_count = 0;
+    editor.file_capacity = 0;
+}
+
+void refresh_file_list(void) {
+    free_file_list();
+    
+    if (!editor.current_directory) {
+        editor.current_directory = strdup(".");
+    }
+    
+    DIR *dir = opendir(editor.current_directory);
+    if (!dir) {
+        return;
+    }
+    
+    // First pass: count entries
+    struct dirent *entry;
+    int count = 0;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0) continue; // Skip current dir
+        count++;
+    }
+    rewinddir(dir);
+    
+    // Allocate array
+    editor.file_capacity = count + 10; // Some extra space
+    editor.file_list = malloc(editor.file_capacity * sizeof(char*));
+    if (!editor.file_list) {
+        closedir(dir);
+        return;
+    }
+    
+    // Second pass: store entries
+    editor.file_count = 0;
+    while ((entry = readdir(dir)) != NULL && editor.file_count < editor.file_capacity) {
+        if (strcmp(entry->d_name, ".") == 0) continue; // Skip current dir
+        editor.file_list[editor.file_count] = strdup(entry->d_name);
+        editor.file_count++;
+    }
+    
+    closedir(dir);
+    
+    // Reset cursor position
+    editor.file_manager_cursor = 0;
+    editor.file_manager_offset = 0;
+}
+
+void toggle_file_manager(void) {
+    editor.file_manager_visible = !editor.file_manager_visible;
+    
+    if (editor.file_manager_visible && !editor.file_list) {
+        refresh_file_list();
+    }
+    
+    editor.needs_full_redraw = true;
+}
+
+void file_manager_navigate(int direction) {
+    if (!editor.file_manager_visible || editor.file_count == 0) return;
+    
+    editor.file_manager_cursor += direction;
+    
+    if (editor.file_manager_cursor < 0) {
+        editor.file_manager_cursor = 0;
+    } else if (editor.file_manager_cursor >= editor.file_count) {
+        editor.file_manager_cursor = editor.file_count - 1;
+    }
+    
+    // Adjust scroll offset to keep cursor visible
+    int visible_height = editor.screen_rows - 3; // Account for tab bar and status line
+    if (editor.file_manager_cursor < editor.file_manager_offset) {
+        editor.file_manager_offset = editor.file_manager_cursor;
+    } else if (editor.file_manager_cursor >= editor.file_manager_offset + visible_height) {
+        editor.file_manager_offset = editor.file_manager_cursor - visible_height + 1;
+    }
+    
+    editor.needs_full_redraw = true;
+}
+
+void file_manager_select_item(void) {
+    if (!editor.file_manager_visible || editor.file_count == 0) return;
+    if (editor.file_manager_cursor >= editor.file_count) return;
+    
+    char *selected = editor.file_list[editor.file_manager_cursor];
+    if (!selected) return;
+    
+    // Build full path
+    char full_path[1024];
+    snprintf(full_path, sizeof(full_path), "%s/%s", editor.current_directory, selected);
+    
+    if (is_directory(full_path)) {
+        // Navigate to directory
+        if (strcmp(selected, "..") == 0) {
+            // Go up one directory
+            char *last_slash = strrchr(editor.current_directory, '/');
+            if (last_slash && last_slash != editor.current_directory) {
+                *last_slash = '\0';
+            } else if (strcmp(editor.current_directory, ".") != 0) {
+                free(editor.current_directory);
+                editor.current_directory = strdup(".");
+            }
+        } else {
+            // Go into subdirectory
+            char new_path[1024];
+            snprintf(new_path, sizeof(new_path), "%s/%s", editor.current_directory, selected);
+            free(editor.current_directory);
+            editor.current_directory = strdup(new_path);
+        }
+        refresh_file_list();
+    } else {
+        // Open file in new tab
+        int new_tab = create_new_tab(full_path);
+        if (new_tab >= 0) {
+            switch_to_tab(new_tab);
+            set_status_message("Opened %s", selected);
+            editor.file_manager_focused = false; // Return focus to editor
+        } else {
+            set_status_message("Error: Could not open %s", selected);
+        }
+    }
+    
+    editor.needs_full_redraw = true;
+}
+
+void draw_file_manager(void) {
+    if (!editor.file_manager_visible) return;
+    
+    int start_col = 1;
+    int width = editor.file_manager_width;
+    int visible_height = editor.screen_rows - 3; // Account for tab bar and status line
+    
+    // Draw file manager background and border
+    for (int y = 0; y < visible_height; y++) {
+        terminal_set_cursor_position(y + 2, start_col); // +2 for tab bar
+        
+        if (editor.file_manager_focused) {
+            printf("\033[44m"); // Blue background when focused
+        } else {
+            printf("\033[100m"); // Dark gray background when not focused
+        }
+        
+        // Clear the line
+        for (int x = 0; x < width; x++) {
+            printf(" ");
+        }
+        
+        // Draw file entry if available
+        int file_index = y + editor.file_manager_offset;
+        if (file_index < editor.file_count && editor.file_list[file_index]) {
+            terminal_set_cursor_position(y + 2, start_col);
+            
+            char *filename = editor.file_list[file_index];
+            char full_path[1024];
+            snprintf(full_path, sizeof(full_path), "%s/%s", editor.current_directory, filename);
+            
+            // Highlight current selection
+            if (file_index == editor.file_manager_cursor) {
+                printf("\033[47m\033[30m"); // White background, black text
+            }
+            
+            // Truncate filename if too long
+            int max_name_len = width - 8; // Leave space for size
+            if ((int)strlen(filename) > max_name_len) {
+                printf("> %-*.*s", max_name_len - 2, max_name_len - 2, filename);
+            } else {
+                printf("> %-*s", max_name_len, filename);
+            }
+            
+            // Show size or <DIR>
+            printf(" %6s", get_file_size_str(full_path));
+        }
+        
+        printf("\033[0m"); // Reset formatting
+    }
+    
+    // Draw vertical border on the right
+    if (!editor.file_manager_overlay_mode) {
+        for (int y = 0; y < visible_height; y++) {
+            terminal_set_cursor_position(y + 2, start_col + width);
+            printf("\033[37m|\033[0m"); // Gray vertical line
+        }
+    }
+}
+
 int main(int argc, char *argv[]) {
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
@@ -1144,6 +1426,18 @@ int main(int argc, char *argv[]) {
     editor.tab_count = 0;
     editor.tab_capacity = 0;
     editor.current_tab = 0;
+    
+    // Initialize file manager
+    editor.file_manager_visible = false;
+    editor.file_manager_overlay_mode = false; // Default to reduce width mode
+    editor.file_manager_width = 25; // Default width
+    editor.current_directory = NULL;
+    editor.file_list = NULL;
+    editor.file_count = 0;
+    editor.file_capacity = 0;
+    editor.file_manager_cursor = 0;
+    editor.file_manager_offset = 0;
+    editor.file_manager_focused = false;
     
     // Create first tab
     const char* filename = (argc > 1) ? argv[1] : NULL;
@@ -1163,7 +1457,7 @@ int main(int argc, char *argv[]) {
     if (tab && tab->filename) {
         set_status_message("Loaded file: %s", tab->filename);
     } else {
-        set_status_message("Ctrl+T:new tab, Ctrl+O:open file, Ctrl+W:close, Ctrl+[/]:switch tabs, Ctrl+S:save, Ctrl+Q:quit");
+        set_status_message("Ctrl+E:file manager, Ctrl+T:new tab, Ctrl+O:open file, Ctrl+W:close, Ctrl+[/]:switch tabs, Ctrl+S:save, Ctrl+Q:quit");
     }
     
     while (1) {
@@ -1201,7 +1495,28 @@ int main(int argc, char *argv[]) {
         
         // Remove debug key codes - status bar now shows file info
         
-        if (editor.filename_input_mode) {
+        // Handle file manager input first (highest priority when focused)
+        if (editor.file_manager_visible && editor.file_manager_focused) {
+            if (c == 27) {  // Escape key
+                editor.file_manager_focused = false;
+                editor.needs_full_redraw = true;
+            } else if (c == CTRL_KEY('e')) {
+                // Allow Ctrl+E to toggle file manager even when focused
+                toggle_file_manager();
+            } else if (c == '\r' || c == '\n') {  // Enter key
+                file_manager_select_item();
+            } else if (c == ARROW_UP) {
+                file_manager_navigate(-1);
+            } else if (c == ARROW_DOWN) {
+                file_manager_navigate(1);
+            } else if (c == '\t') {  // Tab key - switch focus
+                editor.file_manager_focused = false;
+                editor.needs_full_redraw = true;
+                set_status_message("Focus: Editor");
+            }
+            // Don't process any other keys when file manager is focused
+            // This prevents text input from affecting the editor
+        } else if (editor.filename_input_mode) {
             if (c == 27) {  // Escape key
                 exit_filename_input_mode();
             } else if (c == '\r' || c == '\n') {  // Enter key
@@ -1244,6 +1559,18 @@ int main(int argc, char *argv[]) {
                         jump_to_match(editor.current_match);
                     }
                 }
+            }
+        } else if (c == '\t') {  // Tab key - switch focus
+            if (editor.file_manager_visible) {
+                editor.file_manager_focused = !editor.file_manager_focused;
+                editor.needs_full_redraw = true;
+                set_status_message("Focus: %s", editor.file_manager_focused ? "File Manager" : "Editor");
+            }
+        } else if (c == CTRL_KEY('e')) {
+            // Ctrl+E - Toggle file manager
+            toggle_file_manager();
+            if (editor.file_manager_visible) {
+                editor.file_manager_focused = true;
             }
         } else if (c == CTRL_KEY('f')) {
             enter_find_mode();
@@ -1333,11 +1660,19 @@ int main(int argc, char *argv[]) {
                 delete_char();
             }
         } else if (c == ARROW_UP) {
-            clear_selection();
-            move_cursor(0, -1);
+            if (editor.file_manager_visible && editor.file_manager_focused) {
+                file_manager_navigate(-1);
+            } else {
+                clear_selection();
+                move_cursor(0, -1);
+            }
         } else if (c == ARROW_DOWN) {
-            clear_selection();
-            move_cursor(0, 1);
+            if (editor.file_manager_visible && editor.file_manager_focused) {
+                file_manager_navigate(1);
+            } else {
+                clear_selection();
+                move_cursor(0, 1);
+            }
         } else if (c == ARROW_LEFT) {
             Tab* tab = get_current_tab();
             if (tab && tab->selecting) {
