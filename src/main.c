@@ -1,5 +1,38 @@
 #define _GNU_SOURCE
 #include <stdio.h>
+
+// ANSI Color and formatting codes
+#define COLOR_RESET         "\033[0m"
+#define COLOR_BOLD          "\033[1m"
+#define COLOR_NORMAL        "\033[22m"  // Reset bold/dim without affecting colors
+#define COLOR_REVERSE       "\033[7m"
+
+// Foreground colors
+#define FG_BLACK            "\033[30m"
+#define FG_RED              "\033[31m"
+#define FG_GREEN            "\033[32m"
+#define FG_YELLOW           "\033[33m"
+#define FG_BLUE             "\033[34m"
+#define FG_MAGENTA          "\033[35m"
+#define FG_CYAN             "\033[36m"
+#define FG_WHITE            "\033[37m"
+
+// Background colors
+#define BG_RED              "\033[41m"
+#define BG_YELLOW           "\033[43m"
+#define BG_BLUE             "\033[44m"
+#define BG_GRAY             "\033[100m"
+#define BG_WHITE            "\033[47m"
+
+// Common combinations
+#define STYLE_TAB_BAR       COLOR_REVERSE
+#define STYLE_TAB_CURRENT   COLOR_RESET BG_WHITE FG_BLACK
+#define STYLE_LINE_NUMBERS  FG_CYAN
+#define STYLE_QUIT_DIALOG   BG_RED
+#define STYLE_RELOAD_DIALOG BG_YELLOW
+#define STYLE_FILE_MGR_FOCUSED BG_BLUE
+#define STYLE_FILE_MGR_UNFOCUSED BG_GRAY
+#define STYLE_FILE_MGR_SELECTED BG_WHITE FG_BLACK
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -28,6 +61,7 @@ typedef struct {
     bool selecting;
     bool modified;
     char *filename;
+    time_t file_mtime;  // Last known modification time of the file
     int last_cursor_x, last_cursor_y;
     int last_offset_x, last_offset_y;
 } Tab;
@@ -71,6 +105,10 @@ typedef struct {
     
     // Quit confirmation dialog state
     bool quit_confirmation_active;
+    
+    // File reload confirmation dialog state
+    bool reload_confirmation_active;
+    int reload_tab_index;  // Which tab needs reloading
 } Editor;
 
 Editor editor = {0};
@@ -103,6 +141,12 @@ bool has_unsaved_changes(void);
 void show_quit_confirmation(void);
 void draw_quit_confirmation(void);
 int find_tab_with_file(const char* filename);
+time_t get_file_mtime(const char* filename);
+void check_file_changes(void);
+void show_reload_confirmation(int tab_index);
+void draw_reload_confirmation(void);
+void reload_file_in_tab(int tab_index);
+void draw_modal(const char* title, const char* message, const char* bg_color, const char* fg_color);
 
 Tab* get_current_tab(void) {
     if (editor.current_tab >= 0 && editor.current_tab < editor.tab_count) {
@@ -133,8 +177,11 @@ int create_new_tab(const char* filename) {
         if (!buffer_load_from_file(tab->buffer, tab->filename)) {
             buffer_insert_line(tab->buffer, 0, "");
         }
+        // Initialize file modification time for change tracking
+        tab->file_mtime = get_file_mtime(tab->filename);
     } else {
         buffer_insert_line(tab->buffer, 0, "");
+        tab->file_mtime = 0; // No file yet
     }
     
     editor.tab_count++;
@@ -815,8 +862,9 @@ void draw_screen() {
         draw_status_line();
     }
     
-    // Draw quit confirmation dialog if active (overlay on top of everything)
+    // Draw confirmation dialogs if active (overlay on top of everything)
     draw_quit_confirmation();
+    draw_reload_confirmation();
     
     // Show/hide cursor based on mode and selection state
     if (editor.find_mode) {
@@ -1181,6 +1229,8 @@ void save_file() {
     
     if (tab->filename && buffer_save_to_file(tab->buffer, tab->filename)) {
         tab->modified = false;
+        // Update file modification time after saving
+        tab->file_mtime = get_file_mtime(tab->filename);
         set_status_message("File saved: %s", tab->filename);
     } else {
         set_status_message("Error: Could not save file!");
@@ -1299,6 +1349,30 @@ int find_tab_with_file(const char* filename) {
     return -1; // Not found
 }
 
+time_t get_file_mtime(const char* filename) {
+    if (!filename) return 0;
+    
+    struct stat statbuf;
+    if (stat(filename, &statbuf) == 0) {
+        return statbuf.st_mtime;
+    }
+    return 0; // File doesn't exist or error
+}
+
+void check_file_changes(void) {
+    for (int i = 0; i < editor.tab_count; i++) {
+        Tab* tab = &editor.tabs[i];
+        if (tab->filename && tab->file_mtime > 0) {
+            time_t current_mtime = get_file_mtime(tab->filename);
+            if (current_mtime > 0 && current_mtime != tab->file_mtime) {
+                // File has been modified externally
+                show_reload_confirmation(i);
+                break; // Only show one dialog at a time
+            }
+        }
+    }
+}
+
 void show_quit_confirmation(void) {
     editor.quit_confirmation_active = true;
     editor.needs_full_redraw = true;
@@ -1307,21 +1381,108 @@ void show_quit_confirmation(void) {
 void draw_quit_confirmation(void) {
     if (!editor.quit_confirmation_active) return;
     
-    // Calculate dialog dimensions based on terminal size
-    int min_width = 40;  // Minimum dialog width
-    int max_width = editor.screen_cols - 4;  // Leave 2 chars margin on each side
-    int dialog_width = min_width;
+    draw_modal("You have unsaved changes!", 
+               "Press 'q' to quit anyway, or any other key to cancel",
+               STYLE_QUIT_DIALOG, 
+               FG_WHITE);
+}
+
+void show_reload_confirmation(int tab_index) {
+    editor.reload_confirmation_active = true;
+    editor.reload_tab_index = tab_index;
+    editor.needs_full_redraw = true;
+}
+
+void draw_reload_confirmation(void) {
+    if (!editor.reload_confirmation_active) return;
     
-    // Adjust width based on terminal size
-    if (max_width < min_width) {
-        dialog_width = max_width;  // Use full width minus margins for very narrow terminals
-    } else if (max_width >= 60) {
-        dialog_width = 55;  // Use preferred width for wider terminals
+    Tab* tab = &editor.tabs[editor.reload_tab_index];
+    if (!tab || !tab->filename) return;
+    
+    // Get just the filename for display
+    const char* filename = tab->filename;
+    const char* basename = strrchr(filename, '/');
+    if (basename) basename++; else basename = filename;
+    
+    // Construct the message with proper newlines
+    static char message[512];
+    if (tab->modified) {
+        snprintf(message, sizeof(message), 
+                "File: %s\n\nWarning: You have unsaved changes!\n\n'r' to reload, any other key to keep current version", 
+                basename);
     } else {
-        dialog_width = max_width;  // Use available width for medium terminals
+        snprintf(message, sizeof(message), 
+                "File: %s\n\nThe file has been modified outside the editor.\n\n'r' to reload, any other key to keep current version", 
+                basename);
     }
     
-    int dialog_height = 5;
+    draw_modal("File Changed Externally!", 
+               message,
+               STYLE_RELOAD_DIALOG, 
+               FG_BLACK);
+}
+
+void reload_file_in_tab(int tab_index) {
+    if (tab_index < 0 || tab_index >= editor.tab_count) return;
+    
+    Tab* tab = &editor.tabs[tab_index];
+    if (!tab || !tab->filename) return;
+    
+    // Create new buffer with the updated file content
+    TextBuffer* new_buffer = buffer_create();
+    if (!new_buffer) return;
+    
+    if (buffer_load_from_file(new_buffer, tab->filename)) {
+        // Successfully loaded, replace the old buffer
+        buffer_free(tab->buffer);
+        tab->buffer = new_buffer;
+        tab->modified = false;
+        tab->file_mtime = get_file_mtime(tab->filename);
+        
+        // Reset cursor position to top of file
+        tab->cursor_x = 0;
+        tab->cursor_y = 0;
+        tab->offset_x = 0;
+        tab->offset_y = 0;
+        
+        // Clear selection
+        tab->selecting = false;
+        
+        set_status_message("File reloaded: %s", tab->filename);
+        editor.needs_full_redraw = true;
+    } else {
+        // Failed to reload
+        buffer_free(new_buffer);
+        set_status_message("Error: Could not reload file %s", tab->filename);
+    }
+}
+
+void draw_modal(const char* title, const char* message, const char* bg_color, const char* fg_color) {
+    if (!title || !message || !bg_color || !fg_color) return;
+    
+    // Calculate dialog dimensions based on terminal size
+    int min_width = 40;
+    int max_width = editor.screen_cols - 4;
+    int dialog_width = min_width;
+    
+    if (max_width < min_width) {
+        dialog_width = max_width;
+    } else if (max_width >= 60) {
+        dialog_width = 55;
+    } else {
+        dialog_width = max_width;
+    }
+    
+    // Calculate needed height based on newlines in message
+    int line_count = 1; // Start with 1 for the message itself
+    for (const char* p = message; *p; p++) {
+        if (*p == '\n') line_count++;
+    }
+    
+    int dialog_height = 3 + line_count + 2; // Title + empty line + message lines + padding
+    if (dialog_height > editor.screen_rows - 2) {
+        dialog_height = editor.screen_rows - 2; // Don't exceed screen
+    }
     int start_row = (editor.screen_rows - dialog_height) / 2;
     int start_col = (editor.screen_cols - dialog_width) / 2;
     
@@ -1335,71 +1496,94 @@ void draw_quit_confirmation(void) {
     // Draw dialog background
     for (int y = 0; y < dialog_height; y++) {
         terminal_set_cursor_position(start_row + y, start_col);
-        printf("\033[41m\033[37m"); // Red background, white text
+        printf("%s", bg_color);
         for (int x = 0; x < dialog_width; x++) {
             printf(" ");
         }
     }
     
-    // Draw dialog content with calculated text wrapping
-    const char* title = "You have unsaved changes!";
-    const char* message = "Press 'q' to quit anyway, or any other key to cancel";
+    int available_width = dialog_width - 4; // Account for 2-char padding on each side
     
-    int available_width = dialog_width - 4;  // Account for 2-char padding on each side
-    
-    // Draw title (line 1)
+    // Draw title (line 1) - always bold
     terminal_set_cursor_position(start_row + 1, start_col + 2);
-    printf("\033[41m\033[1m\033[37m"); // Red background, bold white text
-    
+    printf("%s%s" COLOR_BOLD, bg_color, fg_color);
     if ((int)strlen(title) <= available_width) {
         printf("%s", title);
     } else {
-        printf("%.*s", available_width, title); // Truncate to fit
+        printf("%.*s", available_width, title);
     }
     
-    // Draw message with proper line wrapping (line 2-3)
-    terminal_set_cursor_position(start_row + 2, start_col + 2);
-    printf("\033[41m\033[0m\033[37m"); // Red background, normal white text
+    // Empty line (line 2) - just skip it for spacing
     
-    int message_len = strlen(message);
-    if (message_len <= available_width) {
-        // Message fits on one line
-        printf("%s", message);
-    } else {
-        // Need to wrap - find best break point within available width
-        int break_pos = available_width;
-        
-        // Look for space to break on (work backwards from available_width)
-        for (int i = available_width - 1; i > available_width / 2; i--) {
-            if (i < message_len && message[i] == ' ') {
-                break_pos = i;
-                break;
-            }
+    // Draw message with newline support (line 3+)
+    char* message_copy = strdup(message); // Make a copy we can modify
+    if (!message_copy) return;
+    
+    char* line = message_copy;
+    int current_row = 3;
+    
+    while (line && current_row < dialog_height - 1) { // Leave room for bottom margin
+        // Find next newline or end of string
+        char* next_line = strchr(line, '\n');
+        if (next_line) {
+            *next_line = '\0'; // Temporarily terminate this line
+            next_line++; // Point to start of next line
         }
         
-        // Print first line
-        printf("%.*s", break_pos, message);
+        // Position cursor for this line
+        terminal_set_cursor_position(start_row + current_row, start_col + 2);
+        printf("%s%s" COLOR_NORMAL, bg_color, fg_color); // Explicitly normal weight
         
-        // Print second line (skip the space if we broke on one)
-        int second_line_start = break_pos;
-        if (second_line_start < message_len && message[second_line_start] == ' ') {
-            second_line_start++;
-        }
-        
-        if (second_line_start < message_len) {
-            terminal_set_cursor_position(start_row + 3, start_col + 2);
-            printf("\033[41m\033[0m\033[37m");
+        // Handle line wrapping if this line is too long
+        int line_len = strlen(line);
+        if (line_len <= available_width) {
+            // Line fits, print it
+            printf("%s", line);
+        } else {
+            // Line is too long, wrap it
+            int break_pos = available_width;
             
-            int remaining_chars = message_len - second_line_start;
-            if (remaining_chars <= available_width) {
-                printf("%s", message + second_line_start);
-            } else {
-                printf("%.*s", available_width, message + second_line_start);
+            // Look for space to break on (work backwards from available_width)
+            for (int i = available_width - 1; i > available_width / 2; i--) {
+                if (i < line_len && line[i] == ' ') {
+                    break_pos = i;
+                    break;
+                }
+            }
+            
+            // Print first part
+            printf("%.*s", break_pos, line);
+            
+            // If there's more text and room for another line, print the rest
+            if (break_pos < line_len && current_row < dialog_height - 2) {
+                current_row++;
+                terminal_set_cursor_position(start_row + current_row, start_col + 2);
+                printf("%s%s" COLOR_NORMAL, bg_color, fg_color); // Explicitly normal weight
+                
+                // Skip leading space if we broke on one
+                int remaining_start = break_pos;
+                if (remaining_start < line_len && line[remaining_start] == ' ') {
+                    remaining_start++;
+                }
+                
+                if (remaining_start < line_len) {
+                    int remaining_len = line_len - remaining_start;
+                    if (remaining_len <= available_width) {
+                        printf("%s", line + remaining_start);
+                    } else {
+                        printf("%.*s", available_width, line + remaining_start);
+                    }
+                }
             }
         }
+        
+        current_row++;
+        line = next_line;
     }
     
-    printf("\033[0m"); // Reset formatting
+    free(message_copy);
+    
+    printf(COLOR_RESET); // Reset formatting
 }
 
 const char* get_file_size_str(const char* filepath) {
@@ -1700,6 +1884,11 @@ int main(int argc, char *argv[]) {
         scroll_if_needed();
         draw_screen();
         
+        // Check for external file changes (only if no dialog is active)
+        if (!editor.quit_confirmation_active && !editor.reload_confirmation_active) {
+            check_file_changes();
+        }
+        
         // Use select to check if input is available with timeout
         fd_set readfds;
         struct timeval timeout;
@@ -1730,6 +1919,23 @@ int main(int argc, char *argv[]) {
                 // User cancelled quit
                 editor.quit_confirmation_active = false;
                 editor.needs_full_redraw = true;
+            }
+        
+        // Handle reload confirmation dialog (second highest priority when active)
+        } else if (editor.reload_confirmation_active) {
+            if (c == 'r' || c == 'R') {
+                // User wants to reload
+                reload_file_in_tab(editor.reload_tab_index);
+                editor.reload_confirmation_active = false;
+            } else {
+                // User wants to keep current version, just update the mtime to stop asking
+                Tab* tab = &editor.tabs[editor.reload_tab_index];
+                if (tab && tab->filename) {
+                    tab->file_mtime = get_file_mtime(tab->filename);
+                }
+                editor.reload_confirmation_active = false;
+                editor.needs_full_redraw = true;
+                set_status_message("Keeping current version");
             }
         
         // Handle file manager input first (highest priority when focused)
