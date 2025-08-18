@@ -729,7 +729,9 @@ void draw_screen() {
                           tab->offset_y != tab->last_offset_y);
     
     if (editor.needs_full_redraw || offset_changed) {
-        terminal_clear_screen();
+        if (editor.needs_full_redraw) {
+            terminal_clear_screen();
+        }
         
         // Draw tab bar
         draw_tab_bar();
@@ -763,7 +765,7 @@ void draw_screen() {
         tab->last_offset_x = tab->offset_x;
         tab->last_offset_y = tab->offset_y;
     } else {
-        draw_tab_bar();
+        // Just update dynamic parts without full redraw
         if (editor.file_manager_visible) {
             draw_file_manager();
         }
@@ -1286,6 +1288,9 @@ void toggle_file_manager(void) {
 void file_manager_navigate(int direction) {
     if (!editor.file_manager_visible || editor.file_count == 0) return;
     
+    int old_cursor = editor.file_manager_cursor;
+    int old_offset = editor.file_manager_offset;
+    
     editor.file_manager_cursor += direction;
     
     if (editor.file_manager_cursor < 0) {
@@ -1302,7 +1307,11 @@ void file_manager_navigate(int direction) {
         editor.file_manager_offset = editor.file_manager_cursor - visible_height + 1;
     }
     
-    editor.needs_full_redraw = true;
+    // Only force redraw if we actually moved or scrolled
+    if (old_cursor != editor.file_manager_cursor || old_offset != editor.file_manager_offset) {
+        // Don't force full screen redraw for file manager navigation
+        // The draw_screen function will handle file manager updates
+    }
 }
 
 void file_manager_select_item(void) {
@@ -1499,7 +1508,7 @@ int main(int argc, char *argv[]) {
         if (editor.file_manager_visible && editor.file_manager_focused) {
             if (c == 27) {  // Escape key
                 editor.file_manager_focused = false;
-                editor.needs_full_redraw = true;
+                // Focus change doesn't need full screen redraw
             } else if (c == CTRL_KEY('e')) {
                 // Allow Ctrl+E to toggle file manager even when focused
                 toggle_file_manager();
@@ -1511,7 +1520,7 @@ int main(int argc, char *argv[]) {
                 file_manager_navigate(1);
             } else if (c == '\t') {  // Tab key - switch focus
                 editor.file_manager_focused = false;
-                editor.needs_full_redraw = true;
+                // Focus change doesn't need full screen redraw
                 set_status_message("Focus: Editor");
             }
             // Don't process any other keys when file manager is focused
@@ -1563,7 +1572,7 @@ int main(int argc, char *argv[]) {
         } else if (c == '\t') {  // Tab key - switch focus
             if (editor.file_manager_visible) {
                 editor.file_manager_focused = !editor.file_manager_focused;
-                editor.needs_full_redraw = true;
+                // Focus change doesn't need full screen redraw
                 set_status_message("Focus: %s", editor.file_manager_focused ? "File Manager" : "Editor");
             }
         } else if (c == CTRL_KEY('e')) {
