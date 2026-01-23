@@ -51,6 +51,23 @@
 #include "terminal.h"
 #include "buffer.h"
 #include "clipboard.h"
+#include "lsp.h"
+#include "lsp_config.h"
+
+// Per-line diagnostic info for rendering
+typedef struct {
+    int line;              // 0-based line number
+    DiagnosticSeverity severity;
+    char *message;
+} LineDiagnostic;
+
+// Stored semantic token for syntax highlighting
+typedef struct {
+    int line;
+    int col;
+    int length;
+    SemanticTokenType type;
+} StoredToken;
 
 typedef struct {
     TextBuffer *buffer;
@@ -64,6 +81,17 @@ typedef struct {
     time_t file_mtime;  // Last known modification time of the file
     int last_cursor_x, last_cursor_y;
     int last_offset_x, last_offset_y;
+
+    // LSP diagnostics for this file
+    LineDiagnostic *diagnostics;
+    int diagnostic_count;
+    int diagnostic_capacity;
+    bool lsp_opened;  // Whether we've sent didOpen to LSP
+
+    // Semantic tokens for syntax highlighting
+    StoredToken *tokens;
+    int token_count;
+    int token_capacity;
 } Tab;
 
 typedef struct {
@@ -109,6 +137,9 @@ typedef struct {
     // File reload confirmation dialog state
     bool reload_confirmation_active;
     int reload_tab_index;  // Which tab needs reloading
+
+    // LSP state
+    bool lsp_enabled;
 } Editor;
 
 Editor editor = {0};
@@ -147,6 +178,18 @@ void show_reload_confirmation(int tab_index);
 void draw_reload_confirmation(void);
 void reload_file_in_tab(int tab_index);
 void draw_modal(const char* title, const char* message, const char* bg_color, const char* fg_color);
+void lsp_diagnostics_handler(const char *uri, Diagnostic *diags, int count);
+void clear_tab_diagnostics(Tab *tab);
+void notify_lsp_file_opened(Tab *tab);
+void notify_lsp_file_changed(Tab *tab);
+void notify_lsp_file_closed(Tab *tab);
+char *get_buffer_content(TextBuffer *buffer);
+DiagnosticSeverity get_line_diagnostic_severity(Tab *tab, int line);
+const char *get_line_diagnostic_message(Tab *tab, int line);
+void lsp_semantic_tokens_handler(const char *uri, SemanticToken *tokens, int count);
+void clear_tab_tokens(Tab *tab);
+void request_semantic_tokens(Tab *tab);
+const char *get_token_color(SemanticTokenType type);
 
 Tab* get_current_tab(void) {
     if (editor.current_tab >= 0 && editor.current_tab < editor.tab_count) {
@@ -197,14 +240,19 @@ void free_tab(Tab* tab) {
         free(tab->filename);
         tab->filename = NULL;
     }
+    clear_tab_diagnostics(tab);
+    clear_tab_tokens(tab);
 }
 
 void close_tab(int tab_index) {
     if (tab_index < 0 || tab_index >= editor.tab_count) return;
-    
+
     // Don't close the last tab
     if (editor.tab_count <= 1) return;
-    
+
+    // Notify LSP that we're closing this file
+    notify_lsp_file_closed(&editor.tabs[tab_index]);
+
     // Free the tab
     free_tab(&editor.tabs[tab_index]);
     
@@ -227,12 +275,24 @@ void close_tab(int tab_index) {
 void switch_to_tab(int tab_index) {
     if (tab_index < 0 || tab_index >= editor.tab_count) return;
     if (tab_index == editor.current_tab) return;
-    
+
     editor.current_tab = tab_index;
     editor.needs_full_redraw = true;
+
+    // Ensure the file is opened in LSP
+    Tab *tab = get_current_tab();
+    if (tab) {
+        notify_lsp_file_opened(tab);
+    }
 }
 
 void cleanup_and_exit(int status) {
+    // Shutdown LSP first
+    if (editor.lsp_enabled) {
+        lsp_shutdown();
+    }
+    lsp_config_free();
+
     terminal_cleanup();
     for (int i = 0; i < editor.tab_count; i++) {
         free_tab(&editor.tabs[i]);
@@ -540,81 +600,126 @@ void move_cursor_word_left() {
     }
 }
 
+// Helper to find the token type at a given position (file coordinates)
+static SemanticTokenType get_token_at(Tab *tab, int line, int col) {
+    if (!tab || !tab->tokens) return TOKEN_UNKNOWN;
+
+    for (int i = 0; i < tab->token_count; i++) {
+        if (tab->tokens[i].line == line &&
+            col >= tab->tokens[i].col &&
+            col < tab->tokens[i].col + tab->tokens[i].length) {
+            return tab->tokens[i].type;
+        }
+    }
+    return TOKEN_UNKNOWN;
+}
+
 void draw_line(int screen_y, int file_y, int start_col) {
     Tab* tab = get_current_tab();
     if (!tab) return;
-    
+
     terminal_set_cursor_position(screen_y + 2, start_col);
     printf("\033[K");
-    
+
     if (file_y < tab->buffer->line_count) {
-        printf("\033[36m%6d\033[0m ", file_y + 1);
-        
+        // Check for diagnostics on this line and color accordingly
+        DiagnosticSeverity sev = get_line_diagnostic_severity(tab, file_y);
+        const char *line_num_color = STYLE_LINE_NUMBERS; // Default cyan
+        if (sev == DIAG_ERROR) {
+            line_num_color = FG_RED;
+        } else if (sev == DIAG_WARNING) {
+            line_num_color = FG_YELLOW;
+        } else if (sev == DIAG_INFO || sev == DIAG_HINT) {
+            line_num_color = FG_BLUE;
+        }
+        printf("%s%6d" COLOR_RESET " ", line_num_color, file_y + 1);
+
         if (tab->buffer->lines[file_y]) {
             char *line = tab->buffer->lines[file_y];
             int len = strlen(line);
             int start_x = tab->offset_x;
             int display_len = editor.screen_cols - editor.line_number_width;
-            
-            // Check if this line has any selection
+
+            // Calculate selection bounds for this line
             bool line_has_selection = false;
-            int sel_start_x = 0, sel_start_y = 0, sel_end_x = 0, sel_end_y = 0;
-            
+            int sel_start = 0, sel_end = 0;
+
             if (tab->selecting) {
-                sel_start_x = tab->select_start_x;
-                sel_start_y = tab->select_start_y;
-                sel_end_x = tab->select_end_x;
-                sel_end_y = tab->select_end_y;
-                
+                int sel_start_x = tab->select_start_x;
+                int sel_start_y = tab->select_start_y;
+                int sel_end_x = tab->select_end_x;
+                int sel_end_y = tab->select_end_y;
+
                 // Normalize selection
                 if (sel_start_y > sel_end_y || (sel_start_y == sel_end_y && sel_start_x > sel_end_x)) {
                     int temp_x = sel_start_x, temp_y = sel_start_y;
                     sel_start_x = sel_end_x; sel_start_y = sel_end_y;
                     sel_end_x = temp_x; sel_end_y = temp_y;
                 }
-                
-                line_has_selection = (file_y >= sel_start_y && file_y <= sel_end_y);
+
+                if (file_y >= sel_start_y && file_y <= sel_end_y) {
+                    line_has_selection = true;
+                    sel_start = (file_y == sel_start_y) ? sel_start_x : 0;
+                    sel_end = (file_y == sel_end_y) ? sel_end_x : len;
+                }
             }
-            
+
             // Handle empty line that's selected
             if (line_has_selection && len == 0) {
                 printf("\033[7m \033[0m");
                 return;
             }
-            
-            if (start_x < len) {
-                int copy_len = (len - start_x < display_len) ? len - start_x : display_len;
-                
-                if (line_has_selection) {
-                    int line_sel_start = (file_y == sel_start_y) ? sel_start_x : 0;
-                    int line_sel_end = (file_y == sel_end_y) ? sel_end_x : len;
-                    
-                    // Adjust for horizontal scrolling
-                    line_sel_start = (line_sel_start >= start_x) ? line_sel_start - start_x : 0;
-                    line_sel_end = (line_sel_end >= start_x) ? line_sel_end - start_x : 0;
-                    
-                    if (line_sel_end > copy_len) line_sel_end = copy_len;
-                    if (line_sel_start > copy_len) line_sel_start = copy_len;
-                    
-                    // Print text with selection highlighting
-                    if (line_sel_start > 0) {
-                        printf("%.*s", line_sel_start, line + start_x);
+
+            // Calculate visible portion
+            int end_x = start_x + display_len;
+            if (end_x > len) end_x = len;
+
+            // Render character by character with syntax highlighting
+            bool has_tokens = (tab->tokens != NULL && tab->token_count > 0);
+            const char *current_color = NULL;
+            bool in_selection = false;
+
+            for (int x = start_x; x < end_x; x++) {
+                bool char_selected = line_has_selection && x >= sel_start && x < sel_end;
+
+                // Handle selection state change
+                if (char_selected != in_selection) {
+                    if (char_selected) {
+                        printf("\033[7m"); // Start reverse video
+                    } else {
+                        printf("\033[27m"); // End reverse video
                     }
-                    if (line_sel_end > line_sel_start) {
-                        printf("\033[7m%.*s\033[0m", line_sel_end - line_sel_start, 
-                               line + start_x + line_sel_start);
-                    }
-                    if (line_sel_end < copy_len) {
-                        printf("%.*s", copy_len - line_sel_end, line + start_x + line_sel_end);
-                    }
-                    
-                    // Show selection extends to end of line (including newline)
-                    if ((file_y != sel_end_y || sel_end_x > len) && line_sel_end >= copy_len) {
-                        printf("\033[7m \033[0m");  // Highlight one space to show newline selection
-                    }
-                } else {
-                    printf("%.*s", copy_len, line + start_x);
+                    in_selection = char_selected;
                 }
+
+                // Get color for this position (syntax highlighting)
+                const char *new_color = NULL;
+                if (has_tokens) {
+                    SemanticTokenType type = get_token_at(tab, file_y, x);
+                    new_color = get_token_color(type);
+                }
+
+                // Apply color change if needed
+                if (new_color != current_color) {
+                    if (new_color) {
+                        printf("%s", new_color);
+                    } else {
+                        printf(COLOR_RESET);
+                        if (in_selection) printf("\033[7m"); // Restore selection
+                    }
+                    current_color = new_color;
+                }
+
+                // Output the character
+                putchar(line[x]);
+            }
+
+            // Reset formatting
+            printf(COLOR_RESET);
+
+            // Show selection extends to end of line
+            if (line_has_selection && sel_end >= len && end_x >= len) {
+                printf("\033[7m \033[0m");
             }
         }
     } else {
@@ -771,11 +876,21 @@ void draw_status_line() {
             const char* size_str = format_file_size(file_size);
             const char* modified_str = tab->modified ? " [modified]" : "";
             
-            if (editor.file_manager_visible && editor.file_manager_focused) {
-                printf("%s  Line %d/%d  %s%s  [FILE MANAGER FOCUSED - Tab to switch]", 
+            // Check for diagnostic on current line
+            const char *diag_msg = get_line_diagnostic_message(tab, tab->cursor_y);
+
+            if (diag_msg) {
+                // Show diagnostic message in status bar
+                DiagnosticSeverity sev = get_line_diagnostic_severity(tab, tab->cursor_y);
+                const char *sev_str = (sev == DIAG_ERROR) ? "error" :
+                                      (sev == DIAG_WARNING) ? "warning" :
+                                      (sev == DIAG_INFO) ? "info" : "hint";
+                printf("[%s] %s", sev_str, diag_msg);
+            } else if (editor.file_manager_visible && editor.file_manager_focused) {
+                printf("%s  Line %d/%d  %s%s  [FILE MANAGER FOCUSED - Tab to switch]",
                        filename, current_line, total_lines, size_str, modified_str);
             } else {
-                printf("%s  Line %d/%d  %s%s", 
+                printf("%s  Line %d/%d  %s%s",
                        filename, current_line, total_lines, size_str, modified_str);
             }
         }
@@ -1000,10 +1115,14 @@ void delete_selection() {
     // Move cursor to start of deleted selection
     tab->cursor_x = start_x;
     tab->cursor_y = start_y;
-    
+
     // Clear selection
     clear_selection();
     tab->modified = true;
+
+    // Notify LSP of the change
+    notify_lsp_file_changed(tab);
+
     editor.needs_full_redraw = true;
 }
 
@@ -1232,6 +1351,9 @@ void save_file() {
         // Update file modification time after saving
         tab->file_mtime = get_file_mtime(tab->filename);
         set_status_message("File saved: %s", tab->filename);
+
+        // Request updated semantic tokens for syntax highlighting
+        request_semantic_tokens(tab);
     } else {
         set_status_message("Error: Could not save file!");
     }
@@ -1240,11 +1362,14 @@ void save_file() {
 void insert_char(char c) {
     Tab* tab = get_current_tab();
     if (!tab) return;
-    
+
     buffer_insert_char(tab->buffer, tab->cursor_y, tab->cursor_x, c);
     tab->cursor_x++;
     tab->modified = true;
-    
+
+    // Notify LSP of the change
+    notify_lsp_file_changed(tab);
+
     // Calculate text start column for consistent drawing
     int text_start_col = 1;
     if (editor.file_manager_visible && !editor.file_manager_overlay_mode) {
@@ -1256,12 +1381,15 @@ void insert_char(char c) {
 void delete_char() {
     Tab* tab = get_current_tab();
     if (!tab) return;
-    
+
     if (tab->cursor_x > 0) {
         buffer_delete_char(tab->buffer, tab->cursor_y, tab->cursor_x - 1);
         tab->cursor_x--;
         tab->modified = true;
-        
+
+        // Notify LSP of the change
+        notify_lsp_file_changed(tab);
+
         // Calculate text start column for consistent drawing
         int text_start_col = 1;
         if (editor.file_manager_visible && !editor.file_manager_overlay_mode) {
@@ -1269,13 +1397,16 @@ void delete_char() {
         }
         draw_line(tab->cursor_y - tab->offset_y, tab->cursor_y, text_start_col);
     } else if (tab->cursor_y > 0) {
-        int prev_line_len = tab->buffer->lines[tab->cursor_y - 1] ? 
+        int prev_line_len = tab->buffer->lines[tab->cursor_y - 1] ?
                            strlen(tab->buffer->lines[tab->cursor_y - 1]) : 0;
         buffer_merge_lines(tab->buffer, tab->cursor_y - 1);
         tab->cursor_y--;
         tab->cursor_x = prev_line_len;
         tab->modified = true;
-        
+
+        // Notify LSP of the change
+        notify_lsp_file_changed(tab);
+
         editor.needs_full_redraw = true;
     }
 }
@@ -1283,12 +1414,15 @@ void delete_char() {
 void insert_newline() {
     Tab* tab = get_current_tab();
     if (!tab) return;
-    
+
     buffer_insert_newline(tab->buffer, tab->cursor_y, tab->cursor_x);
     tab->cursor_y++;
     tab->cursor_x = 0;
     tab->modified = true;
-    
+
+    // Notify LSP of the change
+    notify_lsp_file_changed(tab);
+
     editor.needs_full_redraw = true;
 }
 
@@ -1586,6 +1720,262 @@ void draw_modal(const char* title, const char* message, const char* bg_color, co
     printf(COLOR_RESET); // Reset formatting
 }
 
+// LSP Helper Functions
+
+char *get_buffer_content(TextBuffer *buffer) {
+    if (!buffer) return NULL;
+
+    // Calculate total size needed
+    int total_size = 0;
+    for (int i = 0; i < buffer->line_count; i++) {
+        if (buffer->lines[i]) {
+            total_size += strlen(buffer->lines[i]);
+        }
+        total_size++; // For newline
+    }
+
+    char *content = malloc(total_size + 1);
+    if (!content) return NULL;
+
+    int pos = 0;
+    for (int i = 0; i < buffer->line_count; i++) {
+        if (buffer->lines[i]) {
+            int len = strlen(buffer->lines[i]);
+            memcpy(content + pos, buffer->lines[i], len);
+            pos += len;
+        }
+        content[pos++] = '\n';
+    }
+    content[pos] = '\0';
+
+    return content;
+}
+
+void clear_tab_diagnostics(Tab *tab) {
+    if (!tab) return;
+    if (tab->diagnostics) {
+        for (int i = 0; i < tab->diagnostic_count; i++) {
+            free(tab->diagnostics[i].message);
+        }
+        free(tab->diagnostics);
+        tab->diagnostics = NULL;
+    }
+    tab->diagnostic_count = 0;
+    tab->diagnostic_capacity = 0;
+}
+
+void lsp_diagnostics_handler(const char *uri, Diagnostic *diags, int count) {
+    if (!uri) return;
+
+    // Convert URI to path
+    char *path = lsp_uri_to_path(uri);
+    if (!path) return;
+
+    // Find the tab with this file
+    int tab_idx = find_tab_with_file(path);
+    free(path);
+
+    if (tab_idx < 0) return;
+
+    Tab *tab = &editor.tabs[tab_idx];
+
+    // Clear old diagnostics
+    clear_tab_diagnostics(tab);
+
+    if (count == 0) {
+        editor.needs_full_redraw = true;
+        return;
+    }
+
+    // Store new diagnostics
+    tab->diagnostics = calloc(count, sizeof(LineDiagnostic));
+    if (!tab->diagnostics) return;
+
+    tab->diagnostic_capacity = count;
+    tab->diagnostic_count = count;
+
+    for (int i = 0; i < count; i++) {
+        tab->diagnostics[i].line = diags[i].line;
+        tab->diagnostics[i].severity = diags[i].severity;
+        if (diags[i].message) {
+            tab->diagnostics[i].message = strdup(diags[i].message);
+        }
+    }
+
+    editor.needs_full_redraw = true;
+}
+
+void notify_lsp_file_opened(Tab *tab) {
+    if (!tab || !tab->filename || tab->lsp_opened) return;
+
+    // Check if there's an LSP server configured for this file type
+    const char *ext = strrchr(tab->filename, '.');
+    if (!ext) return;
+
+    const char *command = lsp_config_get_command(ext);
+    if (!command) return;
+
+    // Initialize LSP server if not already running
+    if (!editor.lsp_enabled) {
+        editor.lsp_enabled = lsp_init(command);
+        if (editor.lsp_enabled) {
+            lsp_set_diagnostics_callback(lsp_diagnostics_handler);
+            lsp_set_semantic_tokens_callback(lsp_semantic_tokens_handler);
+        }
+    }
+
+    if (!editor.lsp_enabled) return;
+
+    char *content = get_buffer_content(tab->buffer);
+    if (content) {
+        lsp_did_open(tab->filename, content);
+        free(content);
+        tab->lsp_opened = true;
+
+        // Request semantic tokens for syntax highlighting
+        request_semantic_tokens(tab);
+    }
+}
+
+void notify_lsp_file_changed(Tab *tab) {
+    if (!editor.lsp_enabled || !tab || !tab->filename || !tab->lsp_opened) return;
+
+    char *content = get_buffer_content(tab->buffer);
+    if (content) {
+        lsp_did_change(tab->filename, content);
+        free(content);
+    }
+}
+
+void notify_lsp_file_closed(Tab *tab) {
+    if (!editor.lsp_enabled || !tab || !tab->filename || !tab->lsp_opened) return;
+
+    lsp_did_close(tab->filename);
+    tab->lsp_opened = false;
+}
+
+DiagnosticSeverity get_line_diagnostic_severity(Tab *tab, int line) {
+    if (!tab || !tab->diagnostics) return 0;
+
+    DiagnosticSeverity worst = 0;
+    for (int i = 0; i < tab->diagnostic_count; i++) {
+        if (tab->diagnostics[i].line == line) {
+            // Lower severity number = worse (1=error is worst)
+            if (worst == 0 || tab->diagnostics[i].severity < worst) {
+                worst = tab->diagnostics[i].severity;
+            }
+        }
+    }
+    return worst;
+}
+
+const char *get_line_diagnostic_message(Tab *tab, int line) {
+    if (!tab || !tab->diagnostics) return NULL;
+
+    // Return the worst (lowest severity number) diagnostic message for this line
+    const char *msg = NULL;
+    DiagnosticSeverity worst = 0;
+    for (int i = 0; i < tab->diagnostic_count; i++) {
+        if (tab->diagnostics[i].line == line) {
+            if (worst == 0 || tab->diagnostics[i].severity < worst) {
+                worst = tab->diagnostics[i].severity;
+                msg = tab->diagnostics[i].message;
+            }
+        }
+    }
+    return msg;
+}
+
+// Semantic token functions
+
+void clear_tab_tokens(Tab *tab) {
+    if (!tab) return;
+    free(tab->tokens);
+    tab->tokens = NULL;
+    tab->token_count = 0;
+    tab->token_capacity = 0;
+}
+
+void lsp_semantic_tokens_handler(const char *uri, SemanticToken *tokens, int count) {
+    if (!uri) return;
+
+    // Convert URI to path
+    char *path = lsp_uri_to_path(uri);
+    if (!path) return;
+
+    // Find the tab with this file
+    int tab_idx = find_tab_with_file(path);
+    free(path);
+
+    if (tab_idx < 0) return;
+
+    Tab *tab = &editor.tabs[tab_idx];
+
+    // Clear old tokens
+    clear_tab_tokens(tab);
+
+    if (count == 0 || !tokens) {
+        editor.needs_full_redraw = true;
+        return;
+    }
+
+    // Store new tokens
+    tab->tokens = calloc(count, sizeof(StoredToken));
+    if (!tab->tokens) return;
+
+    tab->token_capacity = count;
+    tab->token_count = count;
+
+    for (int i = 0; i < count; i++) {
+        tab->tokens[i].line = tokens[i].line;
+        tab->tokens[i].col = tokens[i].col;
+        tab->tokens[i].length = tokens[i].length;
+        tab->tokens[i].type = tokens[i].type;
+    }
+
+    editor.needs_full_redraw = true;
+}
+
+void request_semantic_tokens(Tab *tab) {
+    if (!editor.lsp_enabled || !tab || !tab->filename || !tab->lsp_opened) return;
+    lsp_request_semantic_tokens(tab->filename);
+}
+
+const char *get_token_color(SemanticTokenType type) {
+    switch (type) {
+        case TOKEN_KEYWORD:
+        case TOKEN_MODIFIER:
+            return FG_MAGENTA;
+        case TOKEN_TYPE:
+        case TOKEN_CLASS:
+        case TOKEN_ENUM:
+            return FG_YELLOW;
+        case TOKEN_FUNCTION:
+        case TOKEN_METHOD:
+            return FG_BLUE;
+        case TOKEN_VARIABLE:
+        case TOKEN_PARAMETER:
+        case TOKEN_PROPERTY:
+            return FG_CYAN;
+        case TOKEN_STRING:
+            return FG_GREEN;
+        case TOKEN_NUMBER:
+            return FG_RED;
+        case TOKEN_COMMENT:
+            return FG_GREEN;
+        case TOKEN_MACRO:
+            return FG_MAGENTA;
+        case TOKEN_NAMESPACE:
+            return FG_YELLOW;
+        case TOKEN_ENUM_MEMBER:
+            return FG_CYAN;
+        case TOKEN_OPERATOR:
+        case TOKEN_UNKNOWN:
+        default:
+            return NULL;  // Default color
+    }
+}
+
 const char* get_file_size_str(const char* filepath) {
     static char size_str[32];
     struct stat statbuf;
@@ -1877,7 +2267,13 @@ int main(int argc, char *argv[]) {
     editor.file_manager_cursor = 0;
     editor.file_manager_offset = 0;
     editor.file_manager_focused = false;
-    
+
+    // Load LSP configuration
+    lsp_config_load();
+
+    // LSP will be initialized lazily when opening a supported file
+    editor.lsp_enabled = false;
+
     // Create first tab
     const char* filename = (argc > 1) ? argv[1] : NULL;
     if (create_new_tab(filename) < 0) {
@@ -1895,6 +2291,8 @@ int main(int argc, char *argv[]) {
     Tab* tab = get_current_tab();
     if (tab && tab->filename) {
         set_status_message("Loaded file: %s", tab->filename);
+        // Notify LSP about the initially opened file
+        notify_lsp_file_opened(tab);
     } else {
         set_status_message("Ctrl+E:file manager, Ctrl+T:new tab, Ctrl+O:open file, Ctrl+W:close, Ctrl+[/]:switch tabs, Ctrl+S:save, Ctrl+Q:quit");
     }
@@ -1923,17 +2321,31 @@ int main(int argc, char *argv[]) {
         struct timeval timeout;
         FD_ZERO(&readfds);
         FD_SET(STDIN_FILENO, &readfds);
+
+        // Also monitor LSP stdout for incoming messages
+        int lsp_fd = lsp_get_fd();
+        int max_fd = STDIN_FILENO;
+        if (lsp_fd >= 0) {
+            FD_SET(lsp_fd, &readfds);
+            if (lsp_fd > max_fd) max_fd = lsp_fd;
+        }
+
         timeout.tv_sec = 0;
         timeout.tv_usec = 50000; // 50ms timeout
-        
-        int activity = select(STDIN_FILENO + 1, &readfds, NULL, NULL, &timeout);
-        
+
+        int activity = select(max_fd + 1, &readfds, NULL, NULL, &timeout);
+
+        // Process LSP messages if available
+        if (activity > 0 && lsp_fd >= 0 && FD_ISSET(lsp_fd, &readfds)) {
+            lsp_process_incoming();
+        }
+
         int c = 0;
         if (activity > 0 && FD_ISSET(STDIN_FILENO, &readfds)) {
             // Input is available, read it
             c = terminal_read_key();
         } else {
-            // No input available, continue loop for resize checking
+            // No user input available, continue loop for resize checking
             continue;
         }
         

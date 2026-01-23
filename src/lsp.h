@@ -1,0 +1,94 @@
+#ifndef LSP_H
+#define LSP_H
+
+#include <stdbool.h>
+
+// Diagnostic severity levels (LSP spec)
+typedef enum {
+    DIAG_ERROR = 1,
+    DIAG_WARNING = 2,
+    DIAG_INFO = 3,
+    DIAG_HINT = 4
+} DiagnosticSeverity;
+
+// Single diagnostic entry
+typedef struct {
+    int line;           // 0-based line number
+    int col;            // 0-based column number
+    int end_line;       // End position
+    int end_col;
+    DiagnosticSeverity severity;
+    char *message;
+    char *source;       // e.g., "clang"
+} Diagnostic;
+
+// Diagnostics for a file
+typedef struct {
+    char *uri;
+    Diagnostic *items;
+    int count;
+    int capacity;
+} FileDiagnostics;
+
+// Callback for when diagnostics are received
+typedef void (*lsp_diagnostics_callback)(const char *uri, Diagnostic *diags, int count);
+
+// Semantic token types (indices into legend from server)
+typedef enum {
+    TOKEN_VARIABLE = 0,
+    TOKEN_PARAMETER,
+    TOKEN_FUNCTION,
+    TOKEN_METHOD,
+    TOKEN_PROPERTY,
+    TOKEN_CLASS,
+    TOKEN_ENUM,
+    TOKEN_ENUM_MEMBER,
+    TOKEN_TYPE,
+    TOKEN_NAMESPACE,
+    TOKEN_KEYWORD,
+    TOKEN_MODIFIER,
+    TOKEN_COMMENT,
+    TOKEN_STRING,
+    TOKEN_NUMBER,
+    TOKEN_OPERATOR,
+    TOKEN_MACRO,
+    TOKEN_UNKNOWN
+} SemanticTokenType;
+
+// Single semantic token
+typedef struct {
+    int line;       // 0-based
+    int col;        // 0-based
+    int length;
+    SemanticTokenType type;
+} SemanticToken;
+
+// Callback for semantic tokens
+typedef void (*lsp_semantic_tokens_callback)(const char *uri, SemanticToken *tokens, int count);
+
+// Lifecycle
+bool lsp_init(const char *command);  // Spawn LSP server with given command
+void lsp_shutdown(void);
+bool lsp_is_running(void);
+
+// Document sync
+void lsp_did_open(const char *path, const char *content);
+void lsp_did_change(const char *path, const char *content);
+void lsp_did_close(const char *path);
+
+// Polling (call from event loop)
+int lsp_get_fd(void);
+void lsp_process_incoming(void);
+
+// Diagnostics callback
+void lsp_set_diagnostics_callback(lsp_diagnostics_callback cb);
+
+// Semantic tokens
+void lsp_set_semantic_tokens_callback(lsp_semantic_tokens_callback cb);
+void lsp_request_semantic_tokens(const char *path);
+
+// Helper to convert file path to URI
+char *lsp_path_to_uri(const char *path);
+char *lsp_uri_to_path(const char *uri);
+
+#endif

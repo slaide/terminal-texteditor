@@ -1,7 +1,7 @@
 CC = gcc
-CFLAGS = -std=c23 -Wall -Wextra -O2 -g
+CFLAGS = -std=c2x -Wall -Wextra -O2 -g
 TARGET = texteditor
-SOURCES = src/main.c src/terminal.c src/buffer.c src/clipboard.c
+SOURCES = src/main.c src/terminal.c src/buffer.c src/clipboard.c src/json.c src/lsp.c src/lsp_config.c
 
 .PHONY: all clean
 
