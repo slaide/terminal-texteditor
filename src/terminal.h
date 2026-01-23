@@ -24,7 +24,9 @@ enum EditorKey {
     SHIFT_ARROW_UP,
     SHIFT_ARROW_DOWN,
     SHIFT_CTRL_ARROW_LEFT,
-    SHIFT_CTRL_ARROW_RIGHT
+    SHIFT_CTRL_ARROW_RIGHT,
+    MOUSE_SCROLL_UP,
+    MOUSE_SCROLL_DOWN
 };
 
 bool terminal_init(void);

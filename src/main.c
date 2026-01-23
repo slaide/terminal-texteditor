@@ -2681,6 +2681,32 @@ int main(int argc, char *argv[]) {
                               strlen(tab->buffer->lines[tab->cursor_y]) : 0;
                 tab->cursor_x = line_len;
             }
+        } else if (c == MOUSE_SCROLL_UP) {
+            Tab* tab = get_current_tab();
+            if (tab) {
+                int scroll_lines = 3;
+                tab->offset_y -= scroll_lines;
+                if (tab->offset_y < 0) tab->offset_y = 0;
+                // Keep cursor visible
+                if (tab->cursor_y >= tab->offset_y + editor.screen_rows - 2) {
+                    tab->cursor_y = tab->offset_y + editor.screen_rows - 3;
+                }
+                editor.needs_full_redraw = true;
+            }
+        } else if (c == MOUSE_SCROLL_DOWN) {
+            Tab* tab = get_current_tab();
+            if (tab) {
+                int scroll_lines = 3;
+                int max_offset = tab->buffer->line_count - (editor.screen_rows - 2);
+                if (max_offset < 0) max_offset = 0;
+                tab->offset_y += scroll_lines;
+                if (tab->offset_y > max_offset) tab->offset_y = max_offset;
+                // Keep cursor visible
+                if (tab->cursor_y < tab->offset_y) {
+                    tab->cursor_y = tab->offset_y;
+                }
+                editor.needs_full_redraw = true;
+            }
         } else if (c == PAGE_UP) {
             clear_selection();
             int move_lines = editor.screen_rows - 2;

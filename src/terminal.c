@@ -103,9 +103,18 @@ int terminal_read_key(void) {
                     int button = mouse[0] - 32;
                     int x = mouse[1] - 32;
                     int y = mouse[2] - 32;
-                    
+
+                    // Check for scroll wheel events (button codes 64 and 65)
+                    if ((button & 64) != 0) {
+                        if ((button & 1) == 0) {
+                            return MOUSE_SCROLL_UP;
+                        } else {
+                            return MOUSE_SCROLL_DOWN;
+                        }
+                    }
+
                     extern void handle_mouse(int button, int x, int y, int pressed);
-                    
+
                     // Simple mouse event handling
                     if ((button & 32) == 0) {
                         // Button press
