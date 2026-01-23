@@ -76,11 +76,13 @@ int terminal_read_key(void) {
                             case 'B': return CTRL_ARROW_DOWN;
                             case 'C': return CTRL_ARROW_RIGHT;
                             case 'D': return CTRL_ARROW_LEFT;
+                            case 'I': return CTRL_TAB;
                         }
                     } else if (extra[1] == '6') {  // Shift+Ctrl modifier
                         switch (extra[2]) {
                             case 'C': return SHIFT_CTRL_ARROW_RIGHT;
                             case 'D': return SHIFT_CTRL_ARROW_LEFT;
+                            case 'I': return CTRL_SHIFT_TAB;
                         }
                     }
                 }
@@ -95,6 +97,25 @@ int terminal_read_key(void) {
                         case '6': return PAGE_DOWN;
                         case '7': return HOME_KEY;
                         case '8': return END_KEY;
+                    }
+                } else if (seq[1] == '2' && seq[2] == '7') {
+                    // Extended key sequence: CSI 27;modifier;keycode ~
+                    // Used by xterm for Ctrl+Tab, etc.
+                    char ext[8];
+                    int i = 0;
+                    while (i < 7) {
+                        if (read(STDIN_FILENO, &ext[i], 1) != 1) break;
+                        if (ext[i] == '~') break;
+                        i++;
+                    }
+                    ext[i] = '\0';
+                    // Parse ;modifier;keycode
+                    int modifier = 0, keycode = 0;
+                    if (sscanf(ext, ";%d;%d", &modifier, &keycode) == 2) {
+                        if (keycode == 9) { // Tab
+                            if (modifier == 5) return CTRL_TAB;        // Ctrl
+                            if (modifier == 6) return CTRL_SHIFT_TAB;  // Ctrl+Shift
+                        }
                     }
                 }
             } else if (seq[1] == 'M') {

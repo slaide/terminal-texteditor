@@ -768,10 +768,10 @@ void draw_tab_bar() {
         
         // Highlight current tab
         if (i == editor.current_tab) {
-            printf("\033[0m\033[47m\033[30m"); // White background, black text
+            printf("\033[0m\033[7m"); // Reverse video for active tab
             printf(" >%d:%s%s< ", i + 1, basename, tab->modified ? "*" : "");
         } else {
-            printf("\033[0m\033[7m"); // Normal reverse video
+            printf("\033[0m\033[100m\033[97m"); // Grey background, white text for inactive
             printf(" %d:%s%s ", i + 1, basename, tab->modified ? "*" : "");
         }
         
@@ -1257,7 +1257,49 @@ void handle_mouse(int button, int x, int y, int pressed) {
     Tab* tab = get_current_tab();
     if (!tab) return;
 
-    // Ignore clicks on tab bar
+    // Handle clicks on tab bar
+    if (y == 1 && button == 0 && pressed) {
+        // Calculate tab bar start position
+        int tab_start_col = 1;
+        if (editor.file_manager_visible && !editor.file_manager_overlay_mode) {
+            tab_start_col += editor.file_manager_width + 1;
+        }
+
+        // Find which tab was clicked
+        int col = tab_start_col;
+        for (int i = 0; i < editor.tab_count; i++) {
+            Tab* t = &editor.tabs[i];
+            const char* filename = t->filename ? t->filename : "untitled";
+            const char* basename = filename;
+            const char* slash = strrchr(filename, '/');
+            if (slash) basename = slash + 1;
+
+            // Calculate tab width based on format:
+            // Active:   " >N:basename< " or " >N:basename*< "
+            // Inactive: " N:basename "   or " N:basename* "
+            int tab_width;
+            int num_digits = (i + 1 >= 10) ? 2 : 1;
+            if (i == editor.current_tab) {
+                // " >" (2) + num + ":" (1) + basename + maybe "*" + "< " (2)
+                tab_width = 5 + num_digits + strlen(basename) + (t->modified ? 1 : 0);
+            } else {
+                // " " (1) + num + ":" (1) + basename + maybe "*" + " " (1)
+                tab_width = 3 + num_digits + strlen(basename) + (t->modified ? 1 : 0);
+            }
+
+            if (x >= col && x < col + tab_width) {
+                if (i != editor.current_tab) {
+                    switch_to_tab(i);
+                    set_status_message("Switched to tab %d", i + 1);
+                }
+                return;
+            }
+            col += tab_width;
+        }
+        return;
+    }
+
+    // Ignore other clicks on tab bar area
     if (y <= 1) return;
 
     // Calculate file manager boundary
@@ -2525,11 +2567,11 @@ int main(int argc, char *argv[]) {
         } else if (c == CTRL_KEY('o')) {
             // Open file in new tab
             enter_filename_input_mode();
-        } else if (c == CTRL_KEY('[')) {
-            // Ctrl+[ - Previous tab
+        } else if (c == CTRL_KEY('[') || c == CTRL_SHIFT_TAB) {
+            // Ctrl+[ or Ctrl+Shift+Tab - Previous tab
             switch_to_prev_tab();
-        } else if (c == CTRL_KEY(']')) {
-            // Ctrl+] - Next tab
+        } else if (c == CTRL_KEY(']') || c == CTRL_TAB) {
+            // Ctrl+] or Ctrl+Tab - Next tab
             switch_to_next_tab();
         } else if (c == CTRL_KEY('q')) {
             if (has_unsaved_changes()) {
