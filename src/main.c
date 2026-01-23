@@ -1623,18 +1623,42 @@ void free_file_list(void) {
     editor.file_capacity = 0;
 }
 
+int file_list_compare(const void *a, const void *b) {
+    const char *name_a = *(const char **)a;
+    const char *name_b = *(const char **)b;
+
+    // ".." always comes first
+    if (strcmp(name_a, "..") == 0) return -1;
+    if (strcmp(name_b, "..") == 0) return 1;
+
+    // Check if entries are directories
+    char path_a[1024], path_b[1024];
+    snprintf(path_a, sizeof(path_a), "%s/%s", editor.current_directory, name_a);
+    snprintf(path_b, sizeof(path_b), "%s/%s", editor.current_directory, name_b);
+
+    bool is_dir_a = is_directory(path_a);
+    bool is_dir_b = is_directory(path_b);
+
+    // Directories come before files
+    if (is_dir_a && !is_dir_b) return -1;
+    if (!is_dir_a && is_dir_b) return 1;
+
+    // Within same type, sort alphabetically (case-insensitive)
+    return strcasecmp(name_a, name_b);
+}
+
 void refresh_file_list(void) {
     free_file_list();
-    
+
     if (!editor.current_directory) {
         editor.current_directory = strdup(".");
     }
-    
+
     DIR *dir = opendir(editor.current_directory);
     if (!dir) {
         return;
     }
-    
+
     // First pass: count entries
     struct dirent *entry;
     int count = 0;
@@ -1643,7 +1667,7 @@ void refresh_file_list(void) {
         count++;
     }
     rewinddir(dir);
-    
+
     // Allocate array
     editor.file_capacity = count + 10; // Some extra space
     editor.file_list = malloc(editor.file_capacity * sizeof(char*));
@@ -1651,7 +1675,7 @@ void refresh_file_list(void) {
         closedir(dir);
         return;
     }
-    
+
     // Second pass: store entries
     editor.file_count = 0;
     while ((entry = readdir(dir)) != NULL && editor.file_count < editor.file_capacity) {
@@ -1659,9 +1683,14 @@ void refresh_file_list(void) {
         editor.file_list[editor.file_count] = strdup(entry->d_name);
         editor.file_count++;
     }
-    
+
     closedir(dir);
-    
+
+    // Sort: ".." first, then directories, then files (alphabetically within each group)
+    if (editor.file_count > 1) {
+        qsort(editor.file_list, editor.file_count, sizeof(char*), file_list_compare);
+    }
+
     // Reset cursor position
     editor.file_manager_cursor = 0;
     editor.file_manager_offset = 0;
