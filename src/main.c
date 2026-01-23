@@ -946,13 +946,10 @@ void draw_screen() {
             draw_file_manager();
         }
         
-        // Calculate text area position and width
+        // Calculate text area position
         int text_start_col = 1;
-        int text_width = editor.screen_cols;
-        
         if (editor.file_manager_visible && !editor.file_manager_overlay_mode) {
             text_start_col += editor.file_manager_width + 1; // +1 for border
-            text_width -= editor.file_manager_width + 1;
         }
         
         // Draw content (screen_rows - 2 to account for tab bar and status line)
