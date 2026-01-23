@@ -887,7 +887,7 @@ void draw_status_line() {
                                       (sev == DIAG_INFO) ? "info" : "hint";
                 printf("[%s] %s", sev_str, diag_msg);
             } else if (editor.file_manager_visible && editor.file_manager_focused) {
-                printf("%s  Line %d/%d  %s%s  [FILE MANAGER FOCUSED - Tab to switch]",
+                printf("%s  Line %d/%d  %s%s  [FILE MANAGER - Esc to return]",
                        filename, current_line, total_lines, size_str, modified_str);
             } else {
                 printf("%s  Line %d/%d  %s%s",
@@ -978,7 +978,7 @@ void draw_screen() {
     draw_quit_confirmation();
     draw_reload_confirmation();
     
-    // Show/hide cursor based on mode and selection state
+    // Show/hide cursor based on mode, selection state, and focus
     if (editor.find_mode) {
         terminal_show_cursor();
         // Position cursor at end of search query in status line
@@ -989,24 +989,27 @@ void draw_screen() {
         // Position cursor at end of filename input in status line
         int cursor_col = 13 + editor.filename_input_len;  // "Open file: " + input length
         terminal_set_cursor_position(editor.screen_rows, cursor_col);
+    } else if (editor.file_manager_visible && editor.file_manager_focused) {
+        // Hide cursor when file manager is focused
+        terminal_hide_cursor();
     } else if (!tab->selecting) {
         terminal_show_cursor();
-        
+
         // Calculate text area starting column (same logic as in draw_screen)
         int text_start_col = 1;
         if (editor.file_manager_visible && !editor.file_manager_overlay_mode) {
             text_start_col += editor.file_manager_width + 1; // +1 for border
         }
-        
+
         // Simple, direct cursor positioning (adjust for tab bar and file manager)
         int screen_row = (tab->cursor_y - tab->offset_y) + 2;  // +2 for tab bar
         int screen_col = (tab->cursor_x - tab->offset_x) + text_start_col + 7;  // 7 for line numbers
-        
+
         // Make sure we're in the valid text area
         if (screen_row < 2) screen_row = 2;  // Account for tab bar
         if (screen_row >= editor.screen_rows) screen_row = editor.screen_rows - 1;
         if (screen_col < text_start_col + 7) screen_col = text_start_col + 7;
-        
+
         terminal_set_cursor_position(screen_row, screen_col);
     } else {
         terminal_hide_cursor();
@@ -1253,19 +1256,52 @@ void find_previous() {
 void handle_mouse(int button, int x, int y, int pressed) {
     Tab* tab = get_current_tab();
     if (!tab) return;
-    
+
     // Ignore clicks on tab bar
     if (y <= 1) return;
-    
-    // Ignore clicks on line number area
-    if (x <= editor.line_number_width) {
+
+    // Calculate file manager boundary
+    int file_manager_end = 0;
+    if (editor.file_manager_visible && !editor.file_manager_overlay_mode) {
+        file_manager_end = editor.file_manager_width + 1; // +1 for border
+    }
+
+    // Check if click is in file manager area
+    if (editor.file_manager_visible && x <= file_manager_end) {
+        if (button == 0 && pressed) {
+            // Focus file manager
+            if (!editor.file_manager_focused) {
+                editor.file_manager_focused = true;
+                editor.needs_full_redraw = true;
+            }
+            // Handle click to select item in file manager
+            int clicked_index = (y - 2) + editor.file_manager_offset;
+            if (clicked_index >= 0 && clicked_index < editor.file_count) {
+                editor.file_manager_cursor = clicked_index;
+                editor.needs_full_redraw = true;
+            }
+        }
         return;
     }
-    
+
+    // Click is in editor area - focus editor if file manager was focused
+    if (editor.file_manager_focused && button == 0 && pressed) {
+        editor.file_manager_focused = false;
+        editor.needs_full_redraw = true;
+    }
+
+    // Calculate editor area offset
+    int editor_x_offset = file_manager_end;
+
+    // Ignore clicks on line number area
+    if (x <= editor_x_offset + editor.line_number_width) {
+        return;
+    }
+
     if (button == 0) {  // Left mouse button
         if (pressed) {
             // Mouse button pressed - prepare for potential drag operation
-            int buffer_x = x - editor.line_number_width - 1 + tab->offset_x;
+            int buffer_x = x - editor_x_offset - editor.line_number_width - 1 + tab->offset_x;
             int buffer_y = y - 2 + tab->offset_y;  // -2 for tab bar
             
             // Clamp coordinates to valid buffer range
@@ -1297,9 +1333,9 @@ void handle_mouse(int button, int x, int y, int pressed) {
         if (editor.mouse_dragging) {
             // Check for auto-scroll first
             auto_scroll_during_selection(y);
-            
+
             // Convert screen coordinates to buffer coordinates
-            int buffer_x = x - editor.line_number_width - 1 + tab->offset_x;
+            int buffer_x = x - editor_x_offset - editor.line_number_width - 1 + tab->offset_x;
             int buffer_y = y - 2 + tab->offset_y;  // -2 for tab bar
             
             // Clamp coordinates to valid buffer range
@@ -2389,7 +2425,8 @@ int main(int argc, char *argv[]) {
                     break;
                 }
             } else if (c == CTRL_KEY('e')) {
-                // Allow Ctrl+E to toggle file manager even when focused
+                // Ctrl+E when file manager focused -> hide it
+                editor.file_manager_focused = false;
                 toggle_file_manager();
             } else if (c == '\r' || c == '\n') {  // Enter key
                 file_manager_select_item();
@@ -2397,9 +2434,8 @@ int main(int argc, char *argv[]) {
                 file_manager_navigate(-1);
             } else if (c == ARROW_DOWN) {
                 file_manager_navigate(1);
-            } else if (c == '\t') {  // Tab key - switch focus
+            } else if (c == '\t') {  // Tab key - return focus to editor
                 editor.file_manager_focused = false;
-                // Focus change doesn't need full screen redraw
                 set_status_message("Focus: Editor");
             }
             // Don't process any other keys when file manager is focused
@@ -2448,17 +2484,26 @@ int main(int argc, char *argv[]) {
                     }
                 }
             }
-        } else if (c == '\t') {  // Tab key - switch focus
-            if (editor.file_manager_visible) {
-                editor.file_manager_focused = !editor.file_manager_focused;
-                // Focus change doesn't need full screen redraw
-                set_status_message("Focus: %s", editor.file_manager_focused ? "File Manager" : "Editor");
+        } else if (c == '\t') {  // Tab key - insert tab character
+            Tab* tab = get_current_tab();
+            if (tab && tab->selecting) {
+                delete_selection();
             }
+            insert_char('\t');
         } else if (c == CTRL_KEY('e')) {
-            // Ctrl+E - Toggle file manager
-            toggle_file_manager();
-            if (editor.file_manager_visible) {
+            // Smart file manager toggle:
+            // - Hidden -> show and focus
+            // - Visible + editor focused -> focus file manager
+            // - Visible + file manager focused -> hide
+            if (!editor.file_manager_visible) {
+                toggle_file_manager();
                 editor.file_manager_focused = true;
+            } else if (!editor.file_manager_focused) {
+                editor.file_manager_focused = true;
+                set_status_message("Focus: File Manager");
+            } else {
+                editor.file_manager_focused = false;
+                toggle_file_manager();
             }
         } else if (c == CTRL_KEY('f')) {
             enter_find_mode();
