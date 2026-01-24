@@ -1,6 +1,6 @@
 #define _GNU_SOURCE
 #include "lsp.h"
-#include "lsp_config.h"
+#include "editor_config.h"
 #include "json.h"
 #include <stdio.h>
 #include <stdlib.h>

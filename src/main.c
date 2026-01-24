@@ -52,7 +52,7 @@
 #include "buffer.h"
 #include "clipboard.h"
 #include "lsp.h"
-#include "lsp_config.h"
+#include "editor_config.h"
 
 // Per-line diagnostic info for rendering
 typedef struct {
@@ -68,6 +68,15 @@ typedef struct {
     int length;
     SemanticTokenType type;
 } StoredToken;
+
+// Code folding
+typedef struct {
+    int start_line;     // Line that remains visible (0-based)
+    int end_line;       // Last hidden line (inclusive)
+    bool is_folded;     // Currently collapsed
+} Fold;
+
+// FoldStyle is defined in editor_config.h as ConfigFoldStyle
 
 typedef struct {
     TextBuffer *buffer;
@@ -92,6 +101,12 @@ typedef struct {
     StoredToken *tokens;
     int token_count;
     int token_capacity;
+
+    // Code folding
+    Fold *folds;
+    int fold_count;
+    int fold_capacity;
+    ConfigFoldStyle fold_style;
 } Tab;
 
 typedef struct {
@@ -191,6 +206,24 @@ void clear_tab_tokens(Tab *tab);
 void request_semantic_tokens(Tab *tab);
 const char *get_token_color(SemanticTokenType type);
 
+// Code folding functions
+void clear_tab_folds(Tab *tab);
+void detect_folds(Tab *tab);
+// get_fold_style_for_file replaced by editor_config_get_fold_style()
+void detect_folds_braces(Tab *tab);
+void detect_folds_indent(Tab *tab);
+void detect_folds_headings(Tab *tab);
+Fold *get_fold_at_line(Tab *tab, int line);
+Fold *get_fold_containing_line(Tab *tab, int line);
+bool is_line_visible(Tab *tab, int line);
+int get_next_visible_line(Tab *tab, int line);
+int get_prev_visible_line(Tab *tab, int line);
+void toggle_fold_at_line(Tab *tab, int line);
+void add_fold(Tab *tab, int start_line, int end_line);
+int count_folded_lines_before(Tab *tab, int line);
+int file_line_to_display_line(Tab *tab, int file_line);
+int display_line_to_file_line(Tab *tab, int display_line);
+
 Tab* get_current_tab(void) {
     if (editor.current_tab >= 0 && editor.current_tab < editor.tab_count) {
         return &editor.tabs[editor.current_tab];
@@ -222,6 +255,8 @@ int create_new_tab(const char* filename) {
         }
         // Initialize file modification time for change tracking
         tab->file_mtime = get_file_mtime(tab->filename);
+        // Detect foldable regions
+        detect_folds(tab);
     } else {
         buffer_insert_line(tab->buffer, 0, "");
         tab->file_mtime = 0; // No file yet
@@ -242,6 +277,7 @@ void free_tab(Tab* tab) {
     }
     clear_tab_diagnostics(tab);
     clear_tab_tokens(tab);
+    clear_tab_folds(tab);
 }
 
 void close_tab(int tab_index) {
@@ -291,7 +327,7 @@ void cleanup_and_exit(int status) {
     if (editor.lsp_enabled) {
         lsp_shutdown();
     }
-    lsp_config_free();
+    editor_config_free();
 
     terminal_cleanup();
     for (int i = 0; i < editor.tab_count; i++) {
@@ -402,20 +438,41 @@ void process_resize() {
 void move_cursor(int dx, int dy) {
     Tab* tab = get_current_tab();
     if (!tab) return;
-    
+
     if (dy != 0) {
         int new_y = tab->cursor_y + dy;
-        
+
         if (new_y < 0) {
             new_y = 0;
         }
         if (new_y >= tab->buffer->line_count) {
             new_y = tab->buffer->line_count - 1;
         }
-        
+
+        // Skip over folded lines
+        if (dy > 0) {
+            // Moving down: if new_y is inside a fold, skip to after the fold
+            while (new_y < tab->buffer->line_count && !is_line_visible(tab, new_y)) {
+                new_y++;
+            }
+            if (new_y >= tab->buffer->line_count) {
+                new_y = tab->buffer->line_count - 1;
+                // If still not visible, find last visible line
+                while (new_y > 0 && !is_line_visible(tab, new_y)) {
+                    new_y--;
+                }
+            }
+        } else if (dy < 0) {
+            // Moving up: if new_y is inside a fold, skip to the fold start line
+            Fold *fold = get_fold_containing_line(tab, new_y);
+            if (fold) {
+                new_y = fold->start_line;
+            }
+        }
+
         if (new_y != tab->cursor_y) {
             tab->cursor_y = new_y;
-            int line_len = tab->buffer->lines[tab->cursor_y] ? 
+            int line_len = tab->buffer->lines[tab->cursor_y] ?
                            strlen(tab->buffer->lines[tab->cursor_y]) : 0;
             if (tab->cursor_x > line_len) {
                 tab->cursor_x = line_len;
@@ -424,20 +481,26 @@ void move_cursor(int dx, int dy) {
     }
     
     if (dx != 0) {
-        int line_len = tab->buffer->lines[tab->cursor_y] ? 
+        int line_len = tab->buffer->lines[tab->cursor_y] ?
                        strlen(tab->buffer->lines[tab->cursor_y]) : 0;
-        
+
         if (dx < 0 && tab->cursor_x == 0) {
             if (tab->cursor_y > 0) {
-                tab->cursor_y--;
-                int prev_line_len = tab->buffer->lines[tab->cursor_y] ? 
-                                   strlen(tab->buffer->lines[tab->cursor_y]) : 0;
-                tab->cursor_x = prev_line_len;
+                int new_y = get_prev_visible_line(tab, tab->cursor_y);
+                if (new_y >= 0) {
+                    tab->cursor_y = new_y;
+                    int prev_line_len = tab->buffer->lines[tab->cursor_y] ?
+                                       strlen(tab->buffer->lines[tab->cursor_y]) : 0;
+                    tab->cursor_x = prev_line_len;
+                }
             }
         } else if (dx > 0 && tab->cursor_x >= line_len) {
             if (tab->cursor_y < tab->buffer->line_count - 1) {
-                tab->cursor_y++;
-                tab->cursor_x = 0;
+                int new_y = get_next_visible_line(tab, tab->cursor_y);
+                if (new_y < tab->buffer->line_count) {
+                    tab->cursor_y = new_y;
+                    tab->cursor_x = 0;
+                }
             }
         } else {
             int new_x = tab->cursor_x + dx;
@@ -451,14 +514,39 @@ void move_cursor(int dx, int dy) {
 void scroll_if_needed() {
     Tab* tab = get_current_tab();
     if (!tab) return;
-    
+
+    // If cursor is above visible area, scroll up
     if (tab->cursor_y < tab->offset_y) {
         tab->offset_y = tab->cursor_y;
     }
-    if (tab->cursor_y >= tab->offset_y + editor.screen_rows - 2) {
-        tab->offset_y = tab->cursor_y - editor.screen_rows + 3;
+
+    // Count visible lines from offset_y to cursor_y to check if cursor is below visible area
+    int visible_rows = editor.screen_rows - 2;
+    int display_row = 0;
+    int file_y = tab->offset_y;
+    while (file_y < tab->cursor_y && display_row < visible_rows) {
+        if (is_line_visible(tab, file_y)) {
+            display_row++;
+        }
+        file_y++;
     }
-    
+
+    // If cursor is at or beyond the visible area, scroll down
+    if (display_row >= visible_rows) {
+        // Find new offset that puts cursor near bottom of screen
+        int target_row = visible_rows - 1;
+        int new_offset = tab->cursor_y;
+        int rows_counted = 0;
+        while (new_offset > 0 && rows_counted < target_row) {
+            new_offset--;
+            if (is_line_visible(tab, new_offset)) {
+                rows_counted++;
+            }
+        }
+        tab->offset_y = new_offset;
+    }
+
+    // Horizontal scrolling
     if (tab->cursor_x < tab->offset_x) {
         tab->offset_x = tab->cursor_x;
     }
@@ -632,7 +720,62 @@ void draw_line(int screen_y, int file_y, int start_col) {
         } else if (sev == DIAG_INFO || sev == DIAG_HINT) {
             line_num_color = FG_BLUE;
         }
+
+        // Fold indicator
+        Fold *fold = get_fold_at_line(tab, file_y);
+        if (fold) {
+            if (fold->is_folded) {
+                printf(FG_YELLOW "▶" COLOR_RESET);
+            } else {
+                printf(FG_CYAN "▼" COLOR_RESET);
+            }
+        } else {
+            printf(" ");
+        }
+
         printf("%s%6d" COLOR_RESET " ", line_num_color, file_y + 1);
+
+        // Check if this line starts a folded region (reuse fold from above)
+        if (fold && fold->is_folded) {
+            // Check if any part of the fold is selected
+            bool fold_has_selection = false;
+            if (tab->selecting) {
+                int sel_start_y = tab->select_start_y;
+                int sel_end_y = tab->select_end_y;
+                if (sel_start_y > sel_end_y) {
+                    int tmp = sel_start_y;
+                    sel_start_y = sel_end_y;
+                    sel_end_y = tmp;
+                }
+                // Check if selection overlaps with fold region
+                if (sel_start_y <= fold->end_line && sel_end_y >= file_y) {
+                    fold_has_selection = true;
+                }
+            }
+
+            // Show abbreviated content with fold indicator
+            char *line = tab->buffer->lines[file_y];
+            int folded_lines = fold->end_line - fold->start_line;
+            int display_len = editor.screen_cols - editor.line_number_width - 20;
+            if (display_len < 10) display_len = 10;
+
+            // Apply selection highlighting if needed
+            if (fold_has_selection) {
+                printf("\033[7m");  // Reverse video for selection
+            }
+
+            // Print truncated line content
+            int printed = 0;
+            if (line) {
+                for (int i = 0; line[i] && printed < display_len; i++, printed++) {
+                    putchar(line[i]);
+                }
+            }
+
+            // Print fold indicator
+            printf(FG_YELLOW " ... (%d lines)" COLOR_RESET, folded_lines);
+            return;
+        }
 
         if (tab->buffer->lines[file_y]) {
             char *line = tab->buffer->lines[file_y];
@@ -723,7 +866,7 @@ void draw_line(int screen_y, int file_y, int start_col) {
             }
         }
     } else {
-        printf("\033[36m%6s\033[0m ", "~");
+        printf(" \033[36m%6s\033[0m ", "~");  // Space for fold indicator column
     }
 }
 
@@ -953,13 +1096,20 @@ void draw_screen() {
         }
         
         // Draw content (screen_rows - 2 to account for tab bar and status line)
+        // Handle folded lines by skipping invisible ones
+        int file_y = tab->offset_y;
         for (int y = 0; y < editor.screen_rows - 2; y++) {
-            int file_y = y + tab->offset_y;
+            // Skip folded (invisible) lines
+            while (file_y < tab->buffer->line_count && !is_line_visible(tab, file_y)) {
+                file_y++;
+            }
+
             // Temporarily adjust draw_line to handle file manager offset
             if (editor.file_manager_visible && !editor.file_manager_overlay_mode) {
                 terminal_set_cursor_position(y + 2, text_start_col);
             }
             draw_line(y, file_y, text_start_col);
+            file_y++;
         }
         
         draw_status_line();
@@ -1001,9 +1151,16 @@ void draw_screen() {
             text_start_col += editor.file_manager_width + 1; // +1 for border
         }
 
-        // Simple, direct cursor positioning (adjust for tab bar and file manager)
-        int screen_row = (tab->cursor_y - tab->offset_y) + 2;  // +2 for tab bar
-        int screen_col = (tab->cursor_x - tab->offset_x) + text_start_col + 7;  // 7 for line numbers
+        // Calculate screen row accounting for folded lines
+        // Count visible lines from offset_y to cursor_y
+        int visible_lines = 0;
+        for (int y = tab->offset_y; y < tab->cursor_y; y++) {
+            if (is_line_visible(tab, y)) {
+                visible_lines++;
+            }
+        }
+        int screen_row = visible_lines + 2;  // +2 for tab bar
+        int screen_col = (tab->cursor_x - tab->offset_x) + text_start_col + editor.line_number_width;
 
         // Make sure we're in the valid text area
         if (screen_row < 2) screen_row = 2;  // Account for tab bar
@@ -1253,6 +1410,33 @@ void find_previous() {
     jump_to_match(prev);
 }
 
+// Convert screen row (0-based from content area) to file line, accounting for folds
+static int screen_y_to_file_y(Tab *tab, int screen_y) {
+    if (!tab) return screen_y;
+
+    int file_y = tab->offset_y;
+    int current_screen_y = 0;
+
+    while (current_screen_y < screen_y && file_y < tab->buffer->line_count) {
+        // Skip invisible (folded) lines
+        while (file_y < tab->buffer->line_count && !is_line_visible(tab, file_y)) {
+            file_y++;
+        }
+        if (file_y >= tab->buffer->line_count) break;
+
+        if (current_screen_y == screen_y) break;
+        current_screen_y++;
+        file_y++;
+    }
+
+    // Skip any remaining invisible lines
+    while (file_y < tab->buffer->line_count && !is_line_visible(tab, file_y)) {
+        file_y++;
+    }
+
+    return file_y;
+}
+
 void handle_mouse(int button, int x, int y, int pressed) {
     Tab* tab = get_current_tab();
     if (!tab) return;
@@ -1335,7 +1519,33 @@ void handle_mouse(int button, int x, int y, int pressed) {
     // Calculate editor area offset
     int editor_x_offset = file_manager_end;
 
-    // Ignore clicks on line number area
+    // Handle clicks on fold indicator (first column of line number area)
+    if (x == editor_x_offset + 1 && button == 0 && pressed) {
+        // Calculate which file line was clicked
+        int screen_y = y - 2;  // Adjust for tab bar
+        if (screen_y >= 0 && screen_y < editor.screen_rows - 2) {
+            // Find the file line at this screen position (accounting for folds)
+            int file_y = tab->offset_y;
+            for (int sy = 0; sy < screen_y && file_y < tab->buffer->line_count; sy++) {
+                while (file_y < tab->buffer->line_count && !is_line_visible(tab, file_y)) {
+                    file_y++;
+                }
+                file_y++;
+            }
+            // Skip invisible lines to get to the actual displayed line
+            while (file_y < tab->buffer->line_count && !is_line_visible(tab, file_y)) {
+                file_y++;
+            }
+
+            Fold *fold = get_fold_at_line(tab, file_y);
+            if (fold) {
+                toggle_fold_at_line(tab, file_y);
+                return;
+            }
+        }
+    }
+
+    // Ignore other clicks on line number area
     if (x <= editor_x_offset + editor.line_number_width) {
         return;
     }
@@ -1344,8 +1554,9 @@ void handle_mouse(int button, int x, int y, int pressed) {
         if (pressed) {
             // Mouse button pressed - prepare for potential drag operation
             int buffer_x = x - editor_x_offset - editor.line_number_width - 1 + tab->offset_x;
-            int buffer_y = y - 2 + tab->offset_y;  // -2 for tab bar
-            
+            int screen_row = y - 2;  // -2 for tab bar
+            int buffer_y = screen_y_to_file_y(tab, screen_row);
+
             // Clamp coordinates to valid buffer range
             if (buffer_y >= tab->buffer->line_count) {
                 buffer_y = tab->buffer->line_count - 1;
@@ -1378,8 +1589,9 @@ void handle_mouse(int button, int x, int y, int pressed) {
 
             // Convert screen coordinates to buffer coordinates
             int buffer_x = x - editor_x_offset - editor.line_number_width - 1 + tab->offset_x;
-            int buffer_y = y - 2 + tab->offset_y;  // -2 for tab bar
-            
+            int screen_row = y - 2;  // -2 for tab bar
+            int buffer_y = screen_y_to_file_y(tab, screen_row);
+
             // Clamp coordinates to valid buffer range
             if (buffer_y >= tab->buffer->line_count) {
                 buffer_y = tab->buffer->line_count - 1;
@@ -1647,16 +1859,19 @@ void reload_file_in_tab(int tab_index) {
         tab->buffer = new_buffer;
         tab->modified = false;
         tab->file_mtime = get_file_mtime(tab->filename);
-        
+
+        // Re-detect folds
+        detect_folds(tab);
+
         // Reset cursor position to top of file
         tab->cursor_x = 0;
         tab->cursor_y = 0;
         tab->offset_x = 0;
         tab->offset_y = 0;
-        
+
         // Clear selection
         tab->selecting = false;
-        
+
         set_status_message("File reloaded: %s", tab->filename);
         editor.needs_full_redraw = true;
     } else {
@@ -1887,7 +2102,7 @@ void notify_lsp_file_opened(Tab *tab) {
     const char *ext = strrchr(tab->filename, '.');
     if (!ext) return;
 
-    const char *command = lsp_config_get_command(ext);
+    const char *command = editor_config_get_lsp_command(ext);
     if (!command) return;
 
     // Initialize LSP server if not already running
@@ -1970,6 +2185,400 @@ void clear_tab_tokens(Tab *tab) {
     tab->token_count = 0;
     tab->token_capacity = 0;
 }
+
+// ============== Code Folding Implementation ==============
+
+void clear_tab_folds(Tab *tab) {
+    if (!tab) return;
+    free(tab->folds);
+    tab->folds = NULL;
+    tab->fold_count = 0;
+    tab->fold_capacity = 0;
+}
+
+// get_fold_style_for_file is now editor_config_get_fold_style() in editor_config.c
+
+void add_fold(Tab *tab, int start_line, int end_line) {
+    if (!tab || start_line >= end_line) return;
+
+    // Check if fold already exists
+    for (int i = 0; i < tab->fold_count; i++) {
+        if (tab->folds[i].start_line == start_line) return;
+    }
+
+    // Grow array if needed
+    if (tab->fold_count >= tab->fold_capacity) {
+        int new_capacity = tab->fold_capacity == 0 ? 16 : tab->fold_capacity * 2;
+        Fold *new_folds = realloc(tab->folds, new_capacity * sizeof(Fold));
+        if (!new_folds) return;
+        tab->folds = new_folds;
+        tab->fold_capacity = new_capacity;
+    }
+
+    tab->folds[tab->fold_count].start_line = start_line;
+    tab->folds[tab->fold_count].end_line = end_line;
+    tab->folds[tab->fold_count].is_folded = false;
+    tab->fold_count++;
+}
+
+void detect_folds_braces(Tab *tab) {
+    if (!tab || !tab->buffer) return;
+
+    int line_count = tab->buffer->line_count;
+
+    // Stack to track opening brace positions
+    int *brace_stack = malloc(line_count * sizeof(int));
+    int stack_top = -1;
+
+    if (!brace_stack) return;
+
+    for (int line = 0; line < line_count; line++) {
+        const char *text = tab->buffer->lines[line];
+        if (!text) continue;
+
+        bool in_string = false;
+        bool in_char = false;
+        bool escape = false;
+
+        for (int col = 0; text[col]; col++) {
+            char c = text[col];
+
+            if (escape) {
+                escape = false;
+                continue;
+            }
+
+            if (c == '\\') {
+                escape = true;
+                continue;
+            }
+
+            if (c == '"' && !in_char) {
+                in_string = !in_string;
+                continue;
+            }
+
+            if (c == '\'' && !in_string) {
+                in_char = !in_char;
+                continue;
+            }
+
+            if (in_string || in_char) continue;
+
+            if (c == '{') {
+                stack_top++;
+                brace_stack[stack_top] = line;
+            } else if (c == '}' && stack_top >= 0) {
+                int start_line = brace_stack[stack_top];
+                stack_top--;
+                // Only create fold if it spans multiple lines
+                if (line > start_line) {
+                    add_fold(tab, start_line, line);
+                }
+            }
+        }
+    }
+
+    free(brace_stack);
+}
+
+static int get_line_indent(const char *line) {
+    if (!line) return 0;
+    int indent = 0;
+    while (*line == ' ' || *line == '\t') {
+        if (*line == '\t') {
+            indent += 4;  // Treat tab as 4 spaces
+        } else {
+            indent++;
+        }
+        line++;
+    }
+    // Empty or whitespace-only lines don't define indentation
+    if (*line == '\0' || *line == '\n') return -1;
+    return indent;
+}
+
+void detect_folds_indent(Tab *tab) {
+    if (!tab || !tab->buffer) return;
+
+    int line_count = tab->buffer->line_count;
+
+    for (int line = 0; line < line_count; line++) {
+        const char *text = tab->buffer->lines[line];
+        if (!text) continue;
+
+        // Check if line ends with ':'
+        int len = strlen(text);
+        bool ends_with_colon = false;
+        for (int i = len - 1; i >= 0; i--) {
+            if (text[i] == ':') {
+                ends_with_colon = true;
+                break;
+            } else if (text[i] != ' ' && text[i] != '\t' && text[i] != '\n') {
+                break;
+            }
+        }
+
+        if (!ends_with_colon) continue;
+
+        // Find the indentation of this line
+        int base_indent = get_line_indent(text);
+        if (base_indent < 0) continue;
+
+        // Find the end of the indented block
+        int end_line = line;
+        for (int j = line + 1; j < line_count; j++) {
+            int indent = get_line_indent(tab->buffer->lines[j]);
+            if (indent < 0) continue;  // Skip blank lines
+            if (indent <= base_indent) {
+                break;  // Block ended
+            }
+            end_line = j;
+        }
+
+        if (end_line > line) {
+            add_fold(tab, line, end_line);
+        }
+    }
+}
+
+// Get heading level from a line (0 if not a heading)
+static int get_heading_level(const char *line) {
+    if (!line) return 0;
+
+    // Skip leading whitespace
+    while (*line == ' ' || *line == '\t') line++;
+
+    // Count # characters
+    int level = 0;
+    while (*line == '#') {
+        level++;
+        line++;
+    }
+
+    // Must be followed by space or end of line to be a valid heading
+    if (level > 0 && (*line == ' ' || *line == '\t' || *line == '\0' || *line == '\n')) {
+        return level;
+    }
+
+    return 0;
+}
+
+// Check if a line is a code fence (``` or ~~~)
+static bool is_code_fence(const char *line) {
+    if (!line) return false;
+
+    // Skip leading whitespace (up to 3 spaces allowed)
+    int spaces = 0;
+    while (*line == ' ' && spaces < 3) {
+        line++;
+        spaces++;
+    }
+
+    // Check for ``` or ~~~
+    if (strncmp(line, "```", 3) == 0 || strncmp(line, "~~~", 3) == 0) {
+        return true;
+    }
+
+    return false;
+}
+
+void detect_folds_headings(Tab *tab) {
+    if (!tab || !tab->buffer) return;
+
+    int line_count = tab->buffer->line_count;
+    bool in_code_block = false;
+
+    for (int line = 0; line < line_count; line++) {
+        const char *text = tab->buffer->lines[line];
+
+        // Track code block state
+        if (is_code_fence(text)) {
+            in_code_block = !in_code_block;
+            continue;
+        }
+
+        // Skip headings inside code blocks
+        if (in_code_block) continue;
+
+        int level = get_heading_level(text);
+
+        if (level == 0) continue;  // Not a heading
+
+        // Find the end of this heading's section
+        // Section ends at the next heading of same or lower level (more important)
+        // But we need to track code blocks in this inner loop too
+        int end_line = line;
+        bool inner_in_code = false;
+
+        for (int j = line + 1; j < line_count; j++) {
+            const char *inner_text = tab->buffer->lines[j];
+
+            if (is_code_fence(inner_text)) {
+                inner_in_code = !inner_in_code;
+                end_line = j;
+                continue;
+            }
+
+            if (inner_in_code) {
+                end_line = j;
+                continue;
+            }
+
+            int next_level = get_heading_level(inner_text);
+
+            if (next_level > 0 && next_level <= level) {
+                // Found a heading of same or higher importance - stop before it
+                break;
+            }
+            end_line = j;
+        }
+
+        if (end_line > line) {
+            add_fold(tab, line, end_line);
+        }
+    }
+}
+
+void detect_folds(Tab *tab) {
+    if (!tab) return;
+
+    // Clear existing folds (but preserve fold state for matching regions)
+    // For simplicity, just clear for now
+    clear_tab_folds(tab);
+
+    tab->fold_style = editor_config_get_fold_style(tab->filename);
+
+    switch (tab->fold_style) {
+        case FOLD_STYLE_BRACES:
+            detect_folds_braces(tab);
+            break;
+        case FOLD_STYLE_INDENT:
+            detect_folds_indent(tab);
+            break;
+        case FOLD_STYLE_HEADINGS:
+            detect_folds_headings(tab);
+            break;
+        case FOLD_STYLE_NONE:
+        default:
+            break;
+    }
+}
+
+Fold *get_fold_at_line(Tab *tab, int line) {
+    if (!tab) return NULL;
+    for (int i = 0; i < tab->fold_count; i++) {
+        if (tab->folds[i].start_line == line) {
+            return &tab->folds[i];
+        }
+    }
+    return NULL;
+}
+
+Fold *get_fold_containing_line(Tab *tab, int line) {
+    if (!tab) return NULL;
+    for (int i = 0; i < tab->fold_count; i++) {
+        if (tab->folds[i].is_folded &&
+            line > tab->folds[i].start_line &&
+            line <= tab->folds[i].end_line) {
+            return &tab->folds[i];
+        }
+    }
+    return NULL;
+}
+
+bool is_line_visible(Tab *tab, int line) {
+    return get_fold_containing_line(tab, line) == NULL;
+}
+
+int get_next_visible_line(Tab *tab, int line) {
+    if (!tab) return line + 1;
+    int next = line + 1;
+    while (next < tab->buffer->line_count) {
+        Fold *fold = get_fold_containing_line(tab, next);
+        if (!fold) return next;
+        next = fold->end_line + 1;
+    }
+    return next;
+}
+
+int get_prev_visible_line(Tab *tab, int line) {
+    if (!tab) return line - 1;
+    int prev = line - 1;
+    while (prev >= 0) {
+        Fold *fold = get_fold_containing_line(tab, prev);
+        if (!fold) return prev;
+        prev = fold->start_line - 1;
+    }
+    return prev;
+}
+
+void toggle_fold_at_line(Tab *tab, int line) {
+    if (!tab) return;
+
+    Fold *fold = get_fold_at_line(tab, line);
+    if (fold) {
+        fold->is_folded = !fold->is_folded;
+
+        // If we just folded and cursor is inside the fold, move it to the fold line
+        if (fold->is_folded &&
+            tab->cursor_y > fold->start_line &&
+            tab->cursor_y <= fold->end_line) {
+            tab->cursor_y = fold->start_line;
+            int line_len = tab->buffer->lines[tab->cursor_y] ?
+                           strlen(tab->buffer->lines[tab->cursor_y]) : 0;
+            if (tab->cursor_x > line_len) {
+                tab->cursor_x = line_len;
+            }
+        }
+
+        editor.needs_full_redraw = true;
+    }
+}
+
+int count_folded_lines_before(Tab *tab, int line) {
+    if (!tab) return 0;
+    int count = 0;
+    for (int i = 0; i < tab->fold_count; i++) {
+        if (tab->folds[i].is_folded && tab->folds[i].end_line < line) {
+            count += tab->folds[i].end_line - tab->folds[i].start_line;
+        } else if (tab->folds[i].is_folded &&
+                   tab->folds[i].start_line < line &&
+                   tab->folds[i].end_line >= line) {
+            // Partially before this line
+            count += line - tab->folds[i].start_line - 1;
+        }
+    }
+    return count;
+}
+
+int file_line_to_display_line(Tab *tab, int file_line) {
+    if (!tab) return file_line;
+    return file_line - count_folded_lines_before(tab, file_line);
+}
+
+int display_line_to_file_line(Tab *tab, int display_line) {
+    if (!tab) return display_line;
+
+    int file_line = 0;
+    int current_display = 0;
+
+    while (current_display < display_line && file_line < tab->buffer->line_count) {
+        if (is_line_visible(tab, file_line)) {
+            current_display++;
+        }
+        file_line++;
+    }
+
+    // Skip any invisible lines at this point
+    while (file_line < tab->buffer->line_count && !is_line_visible(tab, file_line)) {
+        file_line++;
+    }
+
+    return file_line;
+}
+
+// ============== End Code Folding Implementation ==============
 
 void lsp_semantic_tokens_handler(const char *uri, SemanticToken *tokens, int count) {
     if (!uri) return;
@@ -2344,7 +2953,7 @@ int main(int argc, char *argv[]) {
     editor.file_manager_focused = false;
 
     // Load LSP configuration
-    lsp_config_load();
+    editor_config_load();
 
     // LSP will be initialized lazily when opening a supported file
     editor.lsp_enabled = false;
@@ -2360,7 +2969,7 @@ int main(int argc, char *argv[]) {
     terminal_get_window_size(&editor.screen_rows, &editor.screen_cols);
     terminal_enable_mouse();
     
-    editor.line_number_width = 7;  // 6 digits + 1 space
+    editor.line_number_width = 8;  // 1 fold indicator + 6 digits + 1 space
     editor.needs_full_redraw = true;
     
     Tab* tab = get_current_tab();
@@ -2637,6 +3246,17 @@ int main(int argc, char *argv[]) {
                 delete_selection();
             } else {
                 delete_char();
+            }
+        } else if (c == F2_KEY) {
+            // Toggle fold at cursor line
+            Tab *tab = get_current_tab();
+            if (tab) {
+                Fold *fold = get_fold_at_line(tab, tab->cursor_y);
+                if (fold) {
+                    toggle_fold_at_line(tab, tab->cursor_y);
+                    set_status_message(fold->is_folded ? "Folded %d lines" : "Unfolded",
+                                       fold->end_line - fold->start_line);
+                }
             }
         } else if (c == ARROW_UP) {
             if (editor.file_manager_visible && editor.file_manager_focused) {

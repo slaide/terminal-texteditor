@@ -98,6 +98,36 @@ int terminal_read_key(void) {
                         case '7': return HOME_KEY;
                         case '8': return END_KEY;
                     }
+                } else if (seq[1] == '1' && seq[2] >= '0' && seq[2] <= '9') {
+                    // Two-digit codes: F5-F12
+                    char term;
+                    if (read(STDIN_FILENO, &term, 1) != 1) return '\033';
+                    if (term == '~') {
+                        int code = (seq[1] - '0') * 10 + (seq[2] - '0');
+                        switch (code) {
+                            case 15: return F5_KEY;
+                            case 17: return F6_KEY;
+                            case 18: return F7_KEY;
+                            case 19: return F8_KEY;
+                            case 20: return F9_KEY;
+                            case 21: return F10_KEY;
+                            case 23: return F11_KEY;
+                            case 24: return F12_KEY;
+                        }
+                    }
+                } else if (seq[1] == '2' && seq[2] >= '0' && seq[2] <= '9') {
+                    // Two-digit codes starting with 2: F9-F12
+                    char term;
+                    if (read(STDIN_FILENO, &term, 1) != 1) return '\033';
+                    if (term == '~') {
+                        int code = (seq[1] - '0') * 10 + (seq[2] - '0');
+                        switch (code) {
+                            case 20: return F9_KEY;
+                            case 21: return F10_KEY;
+                            case 23: return F11_KEY;
+                            case 24: return F12_KEY;
+                        }
+                    }
                 } else if (seq[1] == '2' && seq[2] == '7') {
                     // Extended key sequence: CSI 27;modifier;keycode ~
                     // Used by xterm for Ctrl+Tab, etc.
@@ -183,6 +213,10 @@ int terminal_read_key(void) {
             switch (seq[1]) {
                 case 'H': return HOME_KEY;
                 case 'F': return END_KEY;
+                case 'P': return F1_KEY;
+                case 'Q': return F2_KEY;
+                case 'R': return F3_KEY;
+                case 'S': return F4_KEY;
             }
         }
 

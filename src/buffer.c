@@ -22,6 +22,7 @@ void buffer_free(TextBuffer *buffer) {
     for (int i = 0; i < buffer->line_count; i++) {
         free(buffer->lines[i]);
     }
+    
     free(buffer->lines);
     free(buffer);
 }

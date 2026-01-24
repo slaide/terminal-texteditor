@@ -1,0 +1,42 @@
+{
+  "languages": {
+    "c": {
+      "extensions": [".c", ".h", ".cpp", ".hpp", ".cc", ".cxx"],
+      "lsp": "clangd --log=error",
+      "fold": "braces"
+    },
+    "python": {
+      "extensions": [".py", ".pyw"],
+      "lsp": "pylsp",
+      "fold": "indent"
+    },
+    "javascript": {
+      "extensions": [".js", ".jsx", ".ts", ".tsx"],
+      "lsp": "typescript-language-server --stdio",
+      "fold": "braces"
+    },
+    "java": {
+      "extensions": [".java"],
+      "lsp": "jdtls",
+      "fold": "braces"
+    },
+    "go": {
+      "extensions": [".go"],
+      "lsp": "gopls",
+      "fold": "braces"
+    },
+    "rust": {
+      "extensions": [".rs"],
+      "lsp": "rust-analyzer",
+      "fold": "braces"
+    },
+    "json": {
+      "extensions": [".json"],
+      "fold": "braces"
+    },
+    "markdown": {
+      "extensions": [".md", ".markdown"],
+      "fold": "headings"
+    }
+  }
+}

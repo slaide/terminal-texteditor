@@ -28,7 +28,19 @@ enum EditorKey {
     MOUSE_SCROLL_UP,
     MOUSE_SCROLL_DOWN,
     CTRL_TAB,
-    CTRL_SHIFT_TAB
+    CTRL_SHIFT_TAB,
+    F1_KEY,
+    F2_KEY,
+    F3_KEY,
+    F4_KEY,
+    F5_KEY,
+    F6_KEY,
+    F7_KEY,
+    F8_KEY,
+    F9_KEY,
+    F10_KEY,
+    F11_KEY,
+    F12_KEY
 };
 
 bool terminal_init(void);
