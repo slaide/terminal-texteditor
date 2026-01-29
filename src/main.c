@@ -22,6 +22,24 @@
 #include "lsp.h"
 #include "editor_config.h"
 
+static long frame_remaining_ms(struct timespec *last_frame, int target_ms) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    long elapsed_ms = (now.tv_sec - last_frame->tv_sec) * 1000L +
+                      (now.tv_nsec - last_frame->tv_nsec) / 1000000L;
+    long remaining = target_ms - elapsed_ms;
+    return remaining > 0 ? remaining : 0;
+}
+
+static bool frame_due(struct timespec *last_frame, int target_ms) {
+    long remaining = frame_remaining_ms(last_frame, target_ms);
+    if (remaining == 0) {
+        clock_gettime(CLOCK_MONOTONIC, last_frame);
+        return true;
+    }
+    return false;
+}
+
 // Per-line diagnostic info for rendering
 typedef struct {
     int line;              // 0-based line number
@@ -52,6 +70,12 @@ typedef struct {
     bool is_dir;
     long size;
 } FileEntry;
+
+typedef struct {
+    char *data;
+    int len;
+    int cap;
+} RenderBuf;
 
 typedef struct {
     TextBuffer *buffer;
@@ -148,7 +172,7 @@ int create_new_tab(const char* filename);
 void close_tab(int tab_index);
 void switch_to_tab(int tab_index);
 void free_tab(Tab* tab);
-void draw_tab_bar(void);
+void draw_tab_bar(RenderBuf *rb);
 void switch_to_next_tab(void);
 void switch_to_prev_tab(void);
 void enter_filename_input_mode(void);
@@ -157,7 +181,7 @@ void process_filename_input(void);
 void clear_selection(void);
 void toggle_file_manager(void);
 void refresh_file_list(void);
-void draw_file_manager(void);
+void draw_file_manager(RenderBuf *rb);
 void file_manager_navigate(int direction);
 void file_manager_select_item(void);
 void free_file_list(void);
@@ -165,14 +189,14 @@ const char* get_file_size_str(long size, bool is_dir);
 bool is_directory(const char* filepath);
 bool has_unsaved_changes(void);
 void show_quit_confirmation(void);
-void draw_quit_confirmation(void);
+void draw_quit_confirmation(RenderBuf *rb);
 int find_tab_with_file(const char* filename);
 time_t get_file_mtime(const char* filename);
 void check_file_changes(void);
 void show_reload_confirmation(int tab_index);
-void draw_reload_confirmation(void);
+void draw_reload_confirmation(RenderBuf *rb);
 void reload_file_in_tab(int tab_index);
-void draw_modal(const char* title, const char* message, const char* bg_color, const char* fg_color);
+void draw_modal(RenderBuf *rb, const char* title, const char* message, const char* bg_color, const char* fg_color);
 void lsp_diagnostics_handler(const char *uri, Diagnostic *diags, int count);
 void clear_tab_diagnostics(Tab *tab);
 void notify_lsp_file_opened(Tab *tab);
@@ -729,12 +753,6 @@ static void build_token_line_index(Tab *tab) {
     }
 }
 
-typedef struct {
-    char *data;
-    int len;
-    int cap;
-} RenderBuf;
-
 static void render_buf_init(RenderBuf *rb) {
     rb->data = NULL;
     rb->len = 0;
@@ -774,14 +792,33 @@ static void render_buf_append_char(RenderBuf *rb, char c) {
     rb->data[rb->len] = '\0';
 }
 
-void draw_line(int screen_y, int file_y, int start_col) {
-    Tab* tab = get_current_tab();
-    if (!tab) return;
+static void render_buf_appendf(RenderBuf *rb, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int needed = vsnprintf(NULL, 0, fmt, ap);
+    va_end(ap);
+    if (needed <= 0) return;
+    if (!render_buf_ensure(rb, needed)) return;
+    va_start(ap, fmt);
+    vsnprintf(rb->data + rb->len, rb->cap - rb->len, fmt, ap);
+    va_end(ap);
+    rb->len += needed;
+}
 
-    terminal_set_cursor_position(screen_y + 2, start_col);
-    RenderBuf rb;
-    render_buf_init(&rb);
-    render_buf_append(&rb, "\033[K");
+static void render_move_cursor(RenderBuf *rb, int row, int col) {
+    render_buf_appendf(rb, "\033[%d;%dH", row, col);
+}
+
+static void render_clear_screen(RenderBuf *rb) {
+    render_buf_append(rb, "\033[2J\033[H");
+}
+
+static void draw_line_to_buf(RenderBuf *rb, int screen_y, int file_y, int start_col) {
+    Tab* tab = get_current_tab();
+    if (!tab || !rb) return;
+
+    render_move_cursor(rb, screen_y + 2, start_col);
+    render_buf_append(rb, "\033[K");
 
     if (file_y < tab->buffer->line_count) {
         // Check for diagnostics on this line and color accordingly
@@ -799,17 +836,17 @@ void draw_line(int screen_y, int file_y, int start_col) {
         Fold *fold = get_fold_at_line(tab, file_y);
         if (fold) {
             if (fold->is_folded) {
-                render_buf_append(&rb, FG_YELLOW "▶" COLOR_RESET);
-            } else {
-                render_buf_append(&rb, FG_CYAN "▼" COLOR_RESET);
-            }
+            render_buf_append(rb, FG_YELLOW "▶" COLOR_RESET);
         } else {
-            render_buf_append(&rb, " ");
+            render_buf_append(rb, FG_CYAN "▼" COLOR_RESET);
         }
+    } else {
+        render_buf_append(rb, " ");
+    }
 
-        char num_buf[32];
-        snprintf(num_buf, sizeof(num_buf), "%s%6d" COLOR_RESET " ", line_num_color, file_y + 1);
-        render_buf_append(&rb, num_buf);
+    char num_buf[32];
+    snprintf(num_buf, sizeof(num_buf), "%s%6d" COLOR_RESET " ", line_num_color, file_y + 1);
+    render_buf_append(rb, num_buf);
 
         // Check if this line starts a folded region (reuse fold from above)
         if (fold && fold->is_folded) {
@@ -837,23 +874,21 @@ void draw_line(int screen_y, int file_y, int start_col) {
 
             // Apply selection highlighting if needed
             if (fold_has_selection) {
-                render_buf_append(&rb, "\033[7m");  // Reverse video for selection
+                render_buf_append(rb, "\033[7m");  // Reverse video for selection
             }
 
             // Print truncated line content
             int printed = 0;
             if (line) {
                 for (int i = 0; line[i] && printed < display_len; i++, printed++) {
-                    render_buf_append_char(&rb, line[i]);
+                    render_buf_append_char(rb, line[i]);
                 }
             }
 
             // Print fold indicator
             char fold_buf[64];
             snprintf(fold_buf, sizeof(fold_buf), FG_YELLOW " ... (%d lines)" COLOR_RESET, folded_lines);
-            render_buf_append(&rb, fold_buf);
-            fwrite(rb.data, 1, rb.len, stdout);
-            render_buf_free(&rb);
+            render_buf_append(rb, fold_buf);
             return;
         }
 
@@ -889,9 +924,7 @@ void draw_line(int screen_y, int file_y, int start_col) {
 
             // Handle empty line that's selected
             if (line_has_selection && len == 0) {
-                render_buf_append(&rb, "\033[7m \033[0m");
-                fwrite(rb.data, 1, rb.len, stdout);
-                render_buf_free(&rb);
+                render_buf_append(rb, "\033[7m \033[0m");
                 return;
             }
 
@@ -910,9 +943,9 @@ void draw_line(int screen_y, int file_y, int start_col) {
                 // Handle selection state change
                 if (char_selected != in_selection) {
                     if (char_selected) {
-                        render_buf_append(&rb, "\033[7m"); // Start reverse video
+                        render_buf_append(rb, "\033[7m"); // Start reverse video
                     } else {
-                        render_buf_append(&rb, "\033[27m"); // End reverse video
+                        render_buf_append(rb, "\033[27m"); // End reverse video
                     }
                     in_selection = char_selected;
                 }
@@ -927,53 +960,58 @@ void draw_line(int screen_y, int file_y, int start_col) {
                 // Apply color change if needed
                 if (new_color != current_color) {
                     if (new_color) {
-                        render_buf_append(&rb, new_color);
+                        render_buf_append(rb, new_color);
                     } else {
-                        render_buf_append(&rb, COLOR_RESET);
-                        if (in_selection) render_buf_append(&rb, "\033[7m"); // Restore selection
+                        render_buf_append(rb, COLOR_RESET);
+                        if (in_selection) render_buf_append(rb, "\033[7m"); // Restore selection
                     }
                     current_color = new_color;
                 }
 
                 // Output the character
-                render_buf_append_char(&rb, line[x]);
+                render_buf_append_char(rb, line[x]);
             }
 
             // Reset formatting
-            render_buf_append(&rb, COLOR_RESET);
+            render_buf_append(rb, COLOR_RESET);
 
             // Show selection extends to end of line
             if (line_has_selection && sel_end >= len && end_x >= len) {
-                render_buf_append(&rb, "\033[7m \033[0m");
+                render_buf_append(rb, "\033[7m \033[0m");
             }
         }
     } else {
         char tilde_buf[32];
         snprintf(tilde_buf, sizeof(tilde_buf), " %s%6s%s ", FG_CYAN, "~", COLOR_RESET);
-        render_buf_append(&rb, tilde_buf);  // Space for fold indicator column
+        render_buf_append(rb, tilde_buf);  // Space for fold indicator column
     }
+}
 
+void draw_line(int screen_y, int file_y, int start_col) {
+    RenderBuf rb;
+    render_buf_init(&rb);
+    draw_line_to_buf(&rb, screen_y, file_y, start_col);
     if (rb.data && rb.len > 0) {
         fwrite(rb.data, 1, rb.len, stdout);
     }
     render_buf_free(&rb);
 }
 
-void draw_tab_bar() {
+void draw_tab_bar(RenderBuf *rb) {
     // Draw "File Browser" label in top-left if file manager is visible
     if (editor.file_manager_visible && !editor.file_manager_overlay_mode) {
-        terminal_set_cursor_position(1, 1);
+        render_move_cursor(rb, 1, 1);
         if (editor.file_manager_focused) {
-            printf("\033[44m\033[1m"); // Blue background, bold when focused
+            render_buf_append(rb, "\033[44m\033[1m"); // Blue background, bold when focused
         } else {
-            printf("\033[100m\033[1m"); // Dark gray background, bold when not focused
+            render_buf_append(rb, "\033[100m\033[1m"); // Dark gray background, bold when not focused
         }
-        printf(" File Browser ");
+        render_buf_append(rb, " File Browser ");
         // Fill remaining width of file manager area
         for (int x = 14; x <= editor.file_manager_width; x++) {
-            printf(" ");
+            render_buf_append(rb, " ");
         }
-        printf("\033[0m"); // Reset formatting
+        render_buf_append(rb, "\033[0m"); // Reset formatting
     }
     
     // Calculate tab bar position and width
@@ -985,8 +1023,8 @@ void draw_tab_bar() {
         tab_width -= editor.file_manager_width + 1;     // Reduce width
     }
     
-    terminal_set_cursor_position(1, tab_start_col);
-    printf("\033[K\033[7m"); // Clear line and reverse video
+    render_move_cursor(rb, 1, tab_start_col);
+    render_buf_append(rb, "\033[K\033[7m"); // Clear line and reverse video
     
     int col = tab_start_col;
     for (int i = 0; i < editor.tab_count; i++) {
@@ -1000,11 +1038,11 @@ void draw_tab_bar() {
         
         // Highlight current tab
         if (i == editor.current_tab) {
-            printf("\033[0m\033[7m"); // Reverse video for active tab
-            printf(" >%d:%s%s< ", i + 1, basename, tab->modified ? "*" : "");
+            render_buf_append(rb, "\033[0m\033[7m"); // Reverse video for active tab
+            render_buf_appendf(rb, " >%d:%s%s< ", i + 1, basename, tab->modified ? "*" : "");
         } else {
-            printf("\033[0m\033[100m\033[97m"); // Grey background, white text for inactive
-            printf(" %d:%s%s ", i + 1, basename, tab->modified ? "*" : "");
+            render_buf_append(rb, "\033[0m\033[100m\033[97m"); // Grey background, white text for inactive
+            render_buf_appendf(rb, " %d:%s%s ", i + 1, basename, tab->modified ? "*" : "");
         }
         
         if (i == editor.current_tab) {
@@ -1014,12 +1052,12 @@ void draw_tab_bar() {
         }
         
         if (col >= tab_start_col + tab_width - 10) {
-            printf("...");
+            render_buf_append(rb, "...");
             break;
         }
     }
     
-    printf("\033[0m"); // Reset formatting
+    render_buf_append(rb, "\033[0m"); // Reset formatting
 }
 
 void switch_to_next_tab(void) {
@@ -1077,28 +1115,28 @@ void process_filename_input(void) {
     exit_filename_input_mode();
 }
 
-void draw_status_line() {
+void draw_status_line(RenderBuf *rb) {
     Tab* tab = get_current_tab();
     if (!tab) return;
     
-    terminal_set_cursor_position(editor.screen_rows, 1);
-    printf("\033[K\033[7m ");
+    render_move_cursor(rb, editor.screen_rows, 1);
+    render_buf_append(rb, "\033[K\033[7m ");
     
     if (editor.find_mode) {
-        printf("Find: %s", editor.search_query ? editor.search_query : "");
+        render_buf_appendf(rb, "Find: %s", editor.search_query ? editor.search_query : "");
         if (editor.total_matches > 0) {
-            printf("  [%d/%d]", editor.current_match, editor.total_matches);
+            render_buf_appendf(rb, "  [%d/%d]", editor.current_match, editor.total_matches);
         } else if (editor.search_query_len > 0) {
-            printf("  [no matches]");
+            render_buf_append(rb, "  [no matches]");
         }
-        printf("  (Ctrl+N: next, Ctrl+P: prev, Esc: exit)");
+        render_buf_append(rb, "  (Ctrl+N: next, Ctrl+P: prev, Esc: exit)");
     } else if (editor.filename_input_mode) {
-        printf("Open file: %s", editor.filename_input ? editor.filename_input : "");
-        printf("  (Enter: open, Esc: cancel)");
+        render_buf_appendf(rb, "Open file: %s", editor.filename_input ? editor.filename_input : "");
+        render_buf_append(rb, "  (Enter: open, Esc: cancel)");
     } else {
         time_t now = time(NULL);
         if (editor.status_message && (now - editor.status_message_time < 3)) {
-            printf("%s", editor.status_message);
+            render_buf_append(rb, editor.status_message);
         } else {
             // Show comprehensive file information
             const char* filename = tab->filename ? tab->filename : "untitled";
@@ -1118,18 +1156,18 @@ void draw_status_line() {
                 const char *sev_str = (sev == DIAG_ERROR) ? "error" :
                                       (sev == DIAG_WARNING) ? "warning" :
                                       (sev == DIAG_INFO) ? "info" : "hint";
-                printf("[%s] %s", sev_str, diag_msg);
+                render_buf_appendf(rb, "[%s] %s", sev_str, diag_msg);
             } else if (editor.file_manager_visible && editor.file_manager_focused) {
-                printf("%s  Line %d/%d  %s%s  LSP:%s  [FILE MANAGER - Esc to return]",
-                       filename, current_line, total_lines, size_str, modified_str, lsp_str);
+                render_buf_appendf(rb, "%s  Line %d/%d  %s%s  LSP:%s  [FILE MANAGER - Esc to return]",
+                                   filename, current_line, total_lines, size_str, modified_str, lsp_str);
             } else {
-                printf("%s  Line %d/%d  %s%s  LSP:%s",
-                       filename, current_line, total_lines, size_str, modified_str, lsp_str);
+                render_buf_appendf(rb, "%s  Line %d/%d  %s%s  LSP:%s",
+                                   filename, current_line, total_lines, size_str, modified_str, lsp_str);
             }
         }
     }
     
-    printf(" \033[0m");
+    render_buf_append(rb, " \033[0m");
 }
 
 int get_file_size() {
@@ -1165,18 +1203,21 @@ void draw_screen() {
     
     bool offset_changed = (tab->offset_x != tab->last_offset_x || 
                           tab->offset_y != tab->last_offset_y);
+
+    RenderBuf rb;
+    render_buf_init(&rb);
     
     if (editor.needs_full_redraw || offset_changed) {
         if (editor.needs_full_redraw) {
-            terminal_clear_screen();
+            render_clear_screen(&rb);
         }
         
         // Draw tab bar
-        draw_tab_bar();
+        draw_tab_bar(&rb);
         
         // Draw file manager if visible
         if (editor.file_manager_visible) {
-            draw_file_manager();
+            draw_file_manager(&rb);
         }
         
         // Calculate text area position
@@ -1194,29 +1235,30 @@ void draw_screen() {
                 file_y++;
             }
 
-            // Temporarily adjust draw_line to handle file manager offset
-            if (editor.file_manager_visible && !editor.file_manager_overlay_mode) {
-                terminal_set_cursor_position(y + 2, text_start_col);
-            }
-            draw_line(y, file_y, text_start_col);
+            draw_line_to_buf(&rb, y, file_y, text_start_col);
             file_y++;
         }
         
-        draw_status_line();
+        draw_status_line(&rb);
         editor.needs_full_redraw = false;
         tab->last_offset_x = tab->offset_x;
         tab->last_offset_y = tab->offset_y;
     } else {
         // Just update dynamic parts without full redraw
         if (editor.file_manager_visible) {
-            draw_file_manager();
+            draw_file_manager(&rb);
         }
-        draw_status_line();
+        draw_status_line(&rb);
     }
     
     // Draw confirmation dialogs if active (overlay on top of everything)
-    draw_quit_confirmation();
-    draw_reload_confirmation();
+    draw_quit_confirmation(&rb);
+    draw_reload_confirmation(&rb);
+
+    if (rb.data && rb.len > 0) {
+        fwrite(rb.data, 1, rb.len, stdout);
+    }
+    render_buf_free(&rb);
     
     // Show/hide cursor based on mode, selection state, and focus
     if (editor.find_mode) {
@@ -1889,10 +1931,10 @@ void show_quit_confirmation(void) {
     editor.needs_full_redraw = true;
 }
 
-void draw_quit_confirmation(void) {
+void draw_quit_confirmation(RenderBuf *rb) {
     if (!editor.quit_confirmation_active) return;
     
-    draw_modal("You have unsaved changes!", 
+    draw_modal(rb, "You have unsaved changes!", 
                "Press 'q' to quit anyway, or any other key to cancel",
                STYLE_QUIT_DIALOG, 
                FG_WHITE);
@@ -1904,7 +1946,7 @@ void show_reload_confirmation(int tab_index) {
     editor.needs_full_redraw = true;
 }
 
-void draw_reload_confirmation(void) {
+void draw_reload_confirmation(RenderBuf *rb) {
     if (!editor.reload_confirmation_active) return;
     
     Tab* tab = &editor.tabs[editor.reload_tab_index];
@@ -1927,7 +1969,7 @@ void draw_reload_confirmation(void) {
                 basename);
     }
     
-    draw_modal("File Changed Externally!", 
+    draw_modal(rb, "File Changed Externally!", 
                message,
                STYLE_RELOAD_DIALOG, 
                FG_BLACK);
@@ -1971,7 +2013,7 @@ void reload_file_in_tab(int tab_index) {
     }
 }
 
-void draw_modal(const char* title, const char* message, const char* bg_color, const char* fg_color) {
+void draw_modal(RenderBuf *rb, const char* title, const char* message, const char* bg_color, const char* fg_color) {
     if (!title || !message || !bg_color || !fg_color) return;
     
     // Calculate dialog dimensions based on terminal size
@@ -2009,22 +2051,22 @@ void draw_modal(const char* title, const char* message, const char* bg_color, co
     
     // Draw dialog background
     for (int y = 0; y < dialog_height; y++) {
-        terminal_set_cursor_position(start_row + y, start_col);
-        printf("%s", bg_color);
+        render_move_cursor(rb, start_row + y, start_col);
+        render_buf_append(rb, bg_color);
         for (int x = 0; x < dialog_width; x++) {
-            printf(" ");
+            render_buf_append(rb, " ");
         }
     }
     
     int available_width = dialog_width - 4; // Account for 2-char padding on each side
     
     // Draw title (line 1) - always bold
-    terminal_set_cursor_position(start_row + 1, start_col + 2);
-    printf("%s%s" COLOR_BOLD, bg_color, fg_color);
+    render_move_cursor(rb, start_row + 1, start_col + 2);
+    render_buf_appendf(rb, "%s%s" COLOR_BOLD, bg_color, fg_color);
     if ((int)strlen(title) <= available_width) {
-        printf("%s", title);
+        render_buf_append(rb, title);
     } else {
-        printf("%.*s", available_width, title);
+        render_buf_appendf(rb, "%.*s", available_width, title);
     }
     
     // Empty line (line 2) - just skip it for spacing
@@ -2045,14 +2087,14 @@ void draw_modal(const char* title, const char* message, const char* bg_color, co
         }
         
         // Position cursor for this line
-        terminal_set_cursor_position(start_row + current_row, start_col + 2);
-        printf("%s%s" COLOR_NORMAL, bg_color, fg_color); // Explicitly normal weight
+        render_move_cursor(rb, start_row + current_row, start_col + 2);
+        render_buf_appendf(rb, "%s%s" COLOR_NORMAL, bg_color, fg_color); // Explicitly normal weight
         
         // Handle line wrapping if this line is too long
         int line_len = strlen(line);
         if (line_len <= available_width) {
             // Line fits, print it
-            printf("%s", line);
+            render_buf_append(rb, line);
         } else {
             // Line is too long, wrap it
             int break_pos = available_width;
@@ -2066,13 +2108,13 @@ void draw_modal(const char* title, const char* message, const char* bg_color, co
             }
             
             // Print first part
-            printf("%.*s", break_pos, line);
+            render_buf_appendf(rb, "%.*s", break_pos, line);
             
             // If there's more text and room for another line, print the rest
             if (break_pos < line_len && current_row < dialog_height - 2) {
                 current_row++;
-                terminal_set_cursor_position(start_row + current_row, start_col + 2);
-                printf("%s%s" COLOR_NORMAL, bg_color, fg_color); // Explicitly normal weight
+                render_move_cursor(rb, start_row + current_row, start_col + 2);
+                render_buf_appendf(rb, "%s%s" COLOR_NORMAL, bg_color, fg_color); // Explicitly normal weight
                 
                 // Skip leading space if we broke on one
                 int remaining_start = break_pos;
@@ -2083,9 +2125,9 @@ void draw_modal(const char* title, const char* message, const char* bg_color, co
                 if (remaining_start < line_len) {
                     int remaining_len = line_len - remaining_start;
                     if (remaining_len <= available_width) {
-                        printf("%s", line + remaining_start);
+                        render_buf_append(rb, line + remaining_start);
                     } else {
-                        printf("%.*s", available_width, line + remaining_start);
+                        render_buf_appendf(rb, "%.*s", available_width, line + remaining_start);
                     }
                 }
             }
@@ -2097,7 +2139,7 @@ void draw_modal(const char* title, const char* message, const char* bg_color, co
     
     free(message_copy);
     
-    printf(COLOR_RESET); // Reset formatting
+    render_buf_append(rb, COLOR_RESET); // Reset formatting
 }
 
 // LSP Helper Functions
@@ -2998,7 +3040,7 @@ void file_manager_select_item(void) {
     editor.needs_full_redraw = true;
 }
 
-void draw_file_manager(void) {
+void draw_file_manager(RenderBuf *rb) {
     if (!editor.file_manager_visible) return;
     
     int start_col = 1;
@@ -3007,53 +3049,53 @@ void draw_file_manager(void) {
     
     // Draw file manager background and border
     for (int y = 0; y < visible_height; y++) {
-        terminal_set_cursor_position(y + 2, start_col); // +2 for tab bar
+        render_move_cursor(rb, y + 2, start_col); // +2 for tab bar
         
         if (editor.file_manager_focused) {
-            printf("\033[44m"); // Blue background when focused
+            render_buf_append(rb, "\033[44m"); // Blue background when focused
         } else {
-            printf("\033[100m"); // Dark gray background when not focused
+            render_buf_append(rb, "\033[100m"); // Dark gray background when not focused
         }
         
         // Clear the line
         for (int x = 0; x < width; x++) {
-            printf(" ");
+            render_buf_append(rb, " ");
         }
         
         // Draw file entry if available
         int file_index = y + editor.file_manager_offset;
         if (file_index < editor.file_count) {
-            terminal_set_cursor_position(y + 2, start_col);
+            render_move_cursor(rb, y + 2, start_col);
             FileEntry *entry = &editor.file_list[file_index];
             if (entry->name) {
                 char *filename = entry->name;
             
             // Highlight current selection
             if (file_index == editor.file_manager_cursor) {
-                printf("\033[47m\033[30m"); // White background, black text
+                render_buf_append(rb, "\033[47m\033[30m"); // White background, black text
             }
             
             // Truncate filename if too long
             int max_name_len = width - 8; // Leave space for size
             if ((int)strlen(filename) > max_name_len) {
-                printf("> %-*.*s", max_name_len - 2, max_name_len - 2, filename);
+                render_buf_appendf(rb, "> %-*.*s", max_name_len - 2, max_name_len - 2, filename);
             } else {
-                printf("> %-*s", max_name_len, filename);
+                render_buf_appendf(rb, "> %-*s", max_name_len, filename);
             }
             
             // Show size or <DIR>
-                printf(" %6s", get_file_size_str(entry->size, entry->is_dir));
+                render_buf_appendf(rb, " %6s", get_file_size_str(entry->size, entry->is_dir));
             }
         }
         
-        printf("\033[0m"); // Reset formatting
+        render_buf_append(rb, "\033[0m"); // Reset formatting
     }
     
     // Draw vertical border on the right
     if (!editor.file_manager_overlay_mode) {
         for (int y = 0; y < visible_height; y++) {
-            terminal_set_cursor_position(y + 2, start_col + width);
-            printf("\033[37m|\033[0m"); // Gray vertical line
+            render_move_cursor(rb, y + 2, start_col + width);
+            render_buf_append(rb, "\033[37m|\033[0m"); // Gray vertical line
         }
     }
 }
@@ -3116,6 +3158,10 @@ int main(int argc, char *argv[]) {
         set_status_message("Ctrl+E:file manager, Ctrl+T:new tab, Ctrl+O:open file, Ctrl+W:close, Ctrl+[/]:switch tabs, Ctrl+S:save, Ctrl+Q:quit");
     }
     
+    struct timespec last_frame = {0};
+    clock_gettime(CLOCK_MONOTONIC, &last_frame);
+    bool pending_draw = true;
+
     while (1) {
         // Check for window resize
         int current_rows, current_cols;
@@ -3124,11 +3170,11 @@ int main(int argc, char *argv[]) {
         if (current_rows > 0 && current_cols > 0 && 
             (current_rows != editor.screen_rows || current_cols != editor.screen_cols)) {
             editor.resize_pending = true;
+            pending_draw = true;
         }
         
         process_resize();
         scroll_if_needed();
-        draw_screen();
         
         // Check for external file changes (only if no dialog is active)
         if (!editor.quit_confirmation_active && !editor.reload_confirmation_active) {
@@ -3149,22 +3195,29 @@ int main(int argc, char *argv[]) {
             if (lsp_fd > max_fd) max_fd = lsp_fd;
         }
 
-        timeout.tv_sec = 0;
-        timeout.tv_usec = 50000; // 50ms timeout
+        long remaining_ms = frame_remaining_ms(&last_frame, 16);
+        timeout.tv_sec = remaining_ms / 1000;
+        timeout.tv_usec = (remaining_ms % 1000) * 1000;
 
         int activity = select(max_fd + 1, &readfds, NULL, NULL, &timeout);
 
         // Process LSP messages if available
         if (activity > 0 && lsp_fd >= 0 && FD_ISSET(lsp_fd, &readfds)) {
             lsp_process_incoming();
+            pending_draw = true;
         }
 
         int c = 0;
         if (activity > 0 && FD_ISSET(STDIN_FILENO, &readfds)) {
             // Input is available, read it
             c = terminal_read_key();
+            pending_draw = true;
         } else {
             // No user input available, continue loop for resize checking
+            if (frame_due(&last_frame, 16) && pending_draw) {
+                draw_screen();
+                pending_draw = false;
+            }
             continue;
         }
         
@@ -3179,6 +3232,7 @@ int main(int argc, char *argv[]) {
                 // User cancelled quit
                 editor.quit_confirmation_active = false;
                 editor.needs_full_redraw = true;
+                pending_draw = true;
             }
         
         // Handle reload confirmation dialog (second highest priority when active)
@@ -3187,6 +3241,7 @@ int main(int argc, char *argv[]) {
                 // User wants to reload
                 reload_file_in_tab(editor.reload_tab_index);
                 editor.reload_confirmation_active = false;
+                pending_draw = true;
             } else {
                 // User wants to keep current version, just update the mtime to stop asking
                 Tab* tab = &editor.tabs[editor.reload_tab_index];
@@ -3196,6 +3251,7 @@ int main(int argc, char *argv[]) {
                 editor.reload_confirmation_active = false;
                 editor.needs_full_redraw = true;
                 set_status_message("Keeping current version");
+                pending_draw = true;
             }
         
         // Handle file manager input first (highest priority when focused)
@@ -3203,6 +3259,7 @@ int main(int argc, char *argv[]) {
             if (c == 27) {  // Escape key
                 editor.file_manager_focused = false;
                 // Focus change doesn't need full screen redraw
+                pending_draw = true;
             } else if (c == CTRL_KEY('q')) {
                 // Allow Ctrl+Q to quit even when file manager is focused
                 if (has_unsaved_changes()) {
@@ -3214,42 +3271,54 @@ int main(int argc, char *argv[]) {
                 // Ctrl+E when file manager focused -> hide it
                 editor.file_manager_focused = false;
                 toggle_file_manager();
+                pending_draw = true;
             } else if (c == '\r' || c == '\n') {  // Enter key
                 file_manager_select_item();
+                pending_draw = true;
             } else if (c == ARROW_UP) {
                 file_manager_navigate(-1);
+                pending_draw = true;
             } else if (c == ARROW_DOWN) {
                 file_manager_navigate(1);
+                pending_draw = true;
             } else if (c == '\t') {  // Tab key - return focus to editor
                 editor.file_manager_focused = false;
                 set_status_message("Focus: Editor");
+                pending_draw = true;
             }
             // Don't process any other keys when file manager is focused
             // This prevents text input from affecting the editor
         } else if (editor.filename_input_mode) {
             if (c == 27) {  // Escape key
                 exit_filename_input_mode();
+                pending_draw = true;
             } else if (c == '\r' || c == '\n') {  // Enter key
                 process_filename_input();
+                pending_draw = true;
             } else if (c == 127 || c == CTRL_KEY('h')) {  // Backspace
                 if (editor.filename_input_len > 0) {
                     editor.filename_input_len--;
                     editor.filename_input[editor.filename_input_len] = '\0';
                 }
+                pending_draw = true;
             } else if (c >= 32 && c < 127) {  // Printable characters
                 if (editor.filename_input_len < editor.filename_input_capacity - 1) {
                     editor.filename_input[editor.filename_input_len] = c;
                     editor.filename_input_len++;
                     editor.filename_input[editor.filename_input_len] = '\0';
                 }
+                pending_draw = true;
             }
         } else if (editor.find_mode) {
             if (c == 27) {  // Escape key
                 exit_find_mode();
+                pending_draw = true;
             } else if (c == CTRL_KEY('n')) {
                 find_next();
+                pending_draw = true;
             } else if (c == CTRL_KEY('p')) {
                 find_previous();
+                pending_draw = true;
             } else if (c == 127 || c == CTRL_KEY('h')) {  // Backspace
                 if (editor.search_query_len > 0) {
                     editor.search_query_len--;
@@ -3259,6 +3328,7 @@ int main(int argc, char *argv[]) {
                         jump_to_match(editor.current_match);
                     }
                 }
+                pending_draw = true;
             } else if (c >= 32 && c < 127) {  // Printable characters
                 if (editor.search_query_len < editor.search_query_capacity - 1) {
                     editor.search_query[editor.search_query_len] = c;
@@ -3269,6 +3339,7 @@ int main(int argc, char *argv[]) {
                         jump_to_match(editor.current_match);
                     }
                 }
+                pending_draw = true;
             }
         } else if (c == '\t') {  // Tab key - insert tab character
             Tab* tab = get_current_tab();
@@ -3276,6 +3347,7 @@ int main(int argc, char *argv[]) {
                 delete_selection();
             }
             insert_char('\t');
+            pending_draw = true;
         } else if (c == CTRL_KEY('e')) {
             // Smart file manager toggle:
             // - Hidden -> show and focus
@@ -3291,8 +3363,10 @@ int main(int argc, char *argv[]) {
                 editor.file_manager_focused = false;
                 toggle_file_manager();
             }
+            pending_draw = true;
         } else if (c == CTRL_KEY('f')) {
             enter_find_mode();
+            pending_draw = true;
         } else if (c == CTRL_KEY('t')) {
             // Create new tab
             int new_tab = create_new_tab(NULL);
@@ -3300,6 +3374,7 @@ int main(int argc, char *argv[]) {
                 switch_to_tab(new_tab);
                 set_status_message("Created new tab %d", new_tab + 1);
             }
+            pending_draw = true;
         } else if (c == CTRL_KEY('w')) {
             // Close current tab
             if (editor.tab_count > 1) {
@@ -3308,23 +3383,29 @@ int main(int argc, char *argv[]) {
             } else {
                 set_status_message("Cannot close last tab");
             }
+            pending_draw = true;
         } else if (c == CTRL_KEY('o')) {
             // Open file in new tab
             enter_filename_input_mode();
+            pending_draw = true;
         } else if (c == CTRL_KEY('[') || c == CTRL_SHIFT_TAB) {
             // Ctrl+[ or Ctrl+Shift+Tab - Previous tab
             switch_to_prev_tab();
+            pending_draw = true;
         } else if (c == CTRL_KEY(']') || c == CTRL_TAB) {
             // Ctrl+] or Ctrl+Tab - Next tab
             switch_to_next_tab();
+            pending_draw = true;
         } else if (c == CTRL_KEY('q')) {
             if (has_unsaved_changes()) {
                 show_quit_confirmation();
             } else {
                 break;
             }
+            pending_draw = true;
         } else if (c == CTRL_KEY('s')) {
             save_file();
+            pending_draw = true;
         } else if (c == CTRL_KEY('c')) {
             char *selected = get_selected_text();
             if (selected) {
@@ -3332,6 +3413,7 @@ int main(int argc, char *argv[]) {
                 free(selected);
                 set_status_message("Copied to clipboard");
             }
+            pending_draw = true;
         } else if (c == CTRL_KEY('x')) {
             char *selected = get_selected_text();
             if (selected) {
@@ -3340,6 +3422,7 @@ int main(int argc, char *argv[]) {
                 delete_selection();
                 set_status_message("Cut to clipboard");
             }
+            pending_draw = true;
         } else if (c == CTRL_KEY('v')) {
             char *clipboard = clipboard_get();
             if (clipboard) {
@@ -3357,6 +3440,7 @@ int main(int argc, char *argv[]) {
                 free(clipboard);
                 set_status_message("Pasted from clipboard");
             }
+            pending_draw = true;
         } else if (c == CTRL_KEY('a')) {
             Tab* tab = get_current_tab();
             if (tab) {
@@ -3369,12 +3453,14 @@ int main(int argc, char *argv[]) {
                 editor.needs_full_redraw = true;
                 set_status_message("Selected all text");
             }
+            pending_draw = true;
         } else if (c == '\r' || c == '\n') {
             Tab* tab = get_current_tab();
             if (tab && tab->selecting) {
                 delete_selection();
             }
             insert_newline();
+            pending_draw = true;
         } else if (c == 127 || c == CTRL_KEY('h')) {
             Tab* tab = get_current_tab();
             if (tab && tab->selecting) {
@@ -3565,6 +3651,11 @@ int main(int argc, char *argv[]) {
                 delete_selection();
             }
             insert_char(c);
+        }
+
+        if (frame_due(&last_frame, 16) && pending_draw) {
+            draw_screen();
+            pending_draw = false;
         }
     }
     
