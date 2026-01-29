@@ -72,8 +72,8 @@ void lsp_shutdown(void);
 bool lsp_is_running(void);
 
 // Document sync
-void lsp_did_open(const char *path, const char *content);
-void lsp_did_change(const char *path, const char *content);
+void lsp_did_open(const char *path, const char *content, const char *language_id);
+void lsp_did_change(const char *path, const char *content, int version);
 void lsp_did_close(const char *path);
 
 // Polling (call from event loop)

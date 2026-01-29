@@ -18,7 +18,7 @@ OBJECTS = $(patsubst src/%.c,$(BUILD_DIR)/%.o,$(SOURCES))
 
 .PHONY: all clean install
 
-all: $(TARGET)
+all: $(TARGET) md-lsp
 
 # Copy executable from build dir to project root
 $(TARGET): $(BUILD_DIR)/$(TARGET)
@@ -37,7 +37,12 @@ $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
 clean:
-	rm -rf build $(TARGET)
+	rm -rf build $(TARGET) md-lsp
 
-install: $(TARGET)
+install: $(TARGET) md-lsp
 	cp $(TARGET) /usr/local/bin/
+	cp md-lsp /usr/local/bin/
+
+# Markdown LSP server
+md-lsp: tools/md-lsp.c
+	$(CC) $(CFLAGS) -o $@ $<

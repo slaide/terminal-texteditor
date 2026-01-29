@@ -36,6 +36,7 @@
     },
     "markdown": {
       "extensions": [".md", ".markdown"],
+      "lsp": "./md-lsp",
       "fold": "headings"
     }
   }

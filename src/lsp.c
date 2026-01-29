@@ -25,6 +25,7 @@ static struct {
     int request_id;
     bool initialized;
     bool running;
+    char *command;
     lsp_diagnostics_callback diagnostics_cb;
     lsp_semantic_tokens_callback semantic_cb;
 
@@ -365,15 +366,48 @@ static void handle_message(JsonValue *msg) {
     }
 }
 
-static void buf_ensure_capacity(int needed) {
+static bool buf_ensure_capacity(int needed) {
     if (lsp.read_buf_len + needed >= lsp.read_buf_capacity) {
         int new_cap = lsp.read_buf_capacity == 0 ? 4096 : lsp.read_buf_capacity * 2;
         while (new_cap < lsp.read_buf_len + needed) new_cap *= 2;
         char *new_buf = realloc(lsp.read_buf, new_cap);
-        if (!new_buf) return;
+        if (!new_buf) return false;
         lsp.read_buf = new_buf;
         lsp.read_buf_capacity = new_cap;
     }
+    return true;
+}
+
+static int find_header_end(const char *buf, int len) {
+    for (int i = 0; i + 3 < len; i++) {
+        if (buf[i] == '\r' && buf[i + 1] == '\n' &&
+            buf[i + 2] == '\r' && buf[i + 3] == '\n') {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static bool parse_content_length(const char *buf, int len, int *out_len) {
+    const char key[] = "Content-Length:";
+    int key_len = (int)sizeof(key) - 1;
+    for (int i = 0; i + key_len <= len; i++) {
+        if (memcmp(buf + i, key, key_len) == 0) {
+            int j = i + key_len;
+            while (j < len && (buf[j] == ' ' || buf[j] == '\t')) j++;
+            int value = 0;
+            bool found = false;
+            while (j < len && buf[j] >= '0' && buf[j] <= '9') {
+                value = value * 10 + (buf[j] - '0');
+                found = true;
+                j++;
+            }
+            if (!found) return false;
+            *out_len = value;
+            return true;
+        }
+    }
+    return false;
 }
 
 // Parse command string into argv array
@@ -418,8 +452,13 @@ static char **parse_command(const char *command, int *argc) {
 }
 
 bool lsp_init(const char *command) {
-    if (lsp.running) return true;
     if (!command) return false;
+    if (lsp.running) {
+        if (lsp.command && strcmp(lsp.command, command) == 0) {
+            return true;
+        }
+        lsp_shutdown();
+    }
 
     // Parse command into argv
     int argc;
@@ -484,6 +523,7 @@ bool lsp_init(const char *command) {
     lsp.stdout_fd = stdout_pipe[0];
     lsp.running = true;
     lsp.request_id = 0;
+    lsp.command = strdup(command);
 
     // Set stdout_fd to non-blocking
     int flags = fcntl(lsp.stdout_fd, F_GETFL, 0);
@@ -596,6 +636,7 @@ void lsp_shutdown(void) {
     }
     free(lsp.token_types);
 
+    free(lsp.command);
     memset(&lsp, 0, sizeof(lsp));
 }
 
@@ -603,29 +644,21 @@ bool lsp_is_running(void) {
     return lsp.running;
 }
 
-static const char *get_language_id(const char *path) {
-    if (!path) return "c";
-    const char *ext = strrchr(path, '.');
-    if (!ext) return "c";
-    if (strcmp(ext, ".cpp") == 0 || strcmp(ext, ".cc") == 0 ||
-        strcmp(ext, ".cxx") == 0 || strcmp(ext, ".hpp") == 0 ||
-        strcmp(ext, ".hxx") == 0 || strcmp(ext, ".C") == 0) {
-        return "cpp";
-    }
-    return "c";
-}
-
-void lsp_did_open(const char *path, const char *content) {
+void lsp_did_open(const char *path, const char *content, const char *language_id) {
     if (!lsp.running || !path || !content) return;
 
     char *uri = lsp_path_to_uri(path);
     if (!uri) return;
 
+    if (!language_id || language_id[0] == '\0') {
+        language_id = "plaintext";
+    }
+
     JsonValue *params = json_object();
     JsonValue *textDoc = json_object();
 
     json_object_set(textDoc, "uri", json_string(uri));
-    json_object_set(textDoc, "languageId", json_string(get_language_id(path)));
+    json_object_set(textDoc, "languageId", json_string(language_id));
     json_object_set(textDoc, "version", json_number(1));
     json_object_set(textDoc, "text", json_string(content));
 
@@ -646,20 +679,17 @@ void lsp_did_open(const char *path, const char *content) {
     }
 }
 
-void lsp_did_change(const char *path, const char *content) {
+void lsp_did_change(const char *path, const char *content, int version) {
     if (!lsp.running || !path || !content) return;
 
     char *uri = lsp_path_to_uri(path);
     if (!uri) return;
 
-    // Use version 2+ for changes (increment could be tracked per-file)
-    static int version = 2;
-
     JsonValue *params = json_object();
     JsonValue *textDoc = json_object();
 
     json_object_set(textDoc, "uri", json_string(uri));
-    json_object_set(textDoc, "version", json_number(version++));
+    json_object_set(textDoc, "version", json_number(version));
 
     json_object_set(params, "textDocument", textDoc);
 
@@ -708,7 +738,7 @@ void lsp_process_incoming(void) {
         ssize_t n = read(lsp.stdout_fd, tmp, sizeof(tmp));
         if (n <= 0) break;
 
-        buf_ensure_capacity(n);
+        if (!buf_ensure_capacity(n)) return;
         memcpy(lsp.read_buf + lsp.read_buf_len, tmp, n);
         lsp.read_buf_len += n;
     }
@@ -716,19 +746,14 @@ void lsp_process_incoming(void) {
     // Process complete messages
     while (lsp.read_buf_len > 0) {
         // Look for Content-Length header
-        char *header_end = strstr(lsp.read_buf, "\r\n\r\n");
-        if (!header_end) break;
+        int header_pos = find_header_end(lsp.read_buf, lsp.read_buf_len);
+        if (header_pos < 0) break;
 
-        int header_len = header_end - lsp.read_buf + 4;
+        int header_len = header_pos + 4;
 
         // Parse Content-Length
         int content_len = 0;
-        char *cl = strstr(lsp.read_buf, "Content-Length:");
-        if (cl && cl < header_end) {
-            content_len = atoi(cl + 15);
-        }
-
-        if (content_len <= 0) {
+        if (!parse_content_length(lsp.read_buf, header_pos, &content_len) || content_len <= 0) {
             // Invalid message, skip header
             memmove(lsp.read_buf, lsp.read_buf + header_len,
                     lsp.read_buf_len - header_len);

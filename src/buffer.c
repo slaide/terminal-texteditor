@@ -201,21 +201,6 @@ char *buffer_get_text_range(TextBuffer *buffer, int start_row, int start_col, in
         end_row < 0 || end_row >= buffer->line_count ||
         start_row > end_row) return NULL;
     
-    if (start_row == end_row) {
-        char *line = buffer->lines[start_row];
-        if (!line) return strdup("");
-        
-        int len = strlen(line);
-        if (start_col >= len) return strdup("");
-        if (end_col > len) end_col = len;
-        if (start_col > end_col) return strdup("");
-        
-        char *result = malloc(end_col - start_col + 1);
-        memcpy(result, line + start_col, end_col - start_col);
-        result[end_col - start_col] = '\0';
-        return result;
-    }
-    
     size_t total_size = 0;
     for (int i = start_row; i <= end_row; i++) {
         char *line = buffer->lines[i];
@@ -226,35 +211,42 @@ char *buffer_get_text_range(TextBuffer *buffer, int start_row, int start_col, in
     
     char *result = malloc(total_size);
     if (!result) return NULL;
-    
-    result[0] = '\0';
-    
+    char *out = result;
+
     for (int i = start_row; i <= end_row; i++) {
         char *line = buffer->lines[i];
-        if (!line) continue;
-        
-        int len = strlen(line);
-        if (i == start_row && i == end_row) {
+        int len = line ? strlen(line) : 0;
+
+        if (i == start_row) {
             int copy_start = (start_col < len) ? start_col : len;
-            int copy_end = (end_col < len) ? end_col : len;
-            if (copy_start < copy_end) {
-                strncat(result, line + copy_start, copy_end - copy_start);
-            }
-        } else if (i == start_row) {
-            if (start_col < len) {
-                strcat(result, line + start_col);
-            }
-            strcat(result, "\n");
-        } else if (i == end_row) {
-            if (end_col > 0 && len > 0) {
+            if (i == end_row) {
                 int copy_end = (end_col < len) ? end_col : len;
-                strncat(result, line, copy_end);
+                if (copy_start < copy_end) {
+                    memcpy(out, line + copy_start, copy_end - copy_start);
+                    out += copy_end - copy_start;
+                }
+            } else {
+                if (copy_start < len) {
+                    memcpy(out, line + copy_start, len - copy_start);
+                    out += len - copy_start;
+                }
+                *out++ = '\n';
+            }
+        } else if (i == end_row) {
+            int copy_end = (end_col < len) ? end_col : len;
+            if (copy_end > 0) {
+                memcpy(out, line, copy_end);
+                out += copy_end;
             }
         } else {
-            strcat(result, line);
-            strcat(result, "\n");
+            if (len > 0) {
+                memcpy(out, line, len);
+                out += len;
+            }
+            *out++ = '\n';
         }
     }
-    
+
+    *out = '\0';
     return result;
 }

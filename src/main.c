@@ -1,38 +1,6 @@
 #define _GNU_SOURCE
 #include <stdio.h>
 
-// ANSI Color and formatting codes
-#define COLOR_RESET         "\033[0m"
-#define COLOR_BOLD          "\033[1m"
-#define COLOR_NORMAL        "\033[22m"  // Reset bold/dim without affecting colors
-#define COLOR_REVERSE       "\033[7m"
-
-// Foreground colors
-#define FG_BLACK            "\033[30m"
-#define FG_RED              "\033[31m"
-#define FG_GREEN            "\033[32m"
-#define FG_YELLOW           "\033[33m"
-#define FG_BLUE             "\033[34m"
-#define FG_MAGENTA          "\033[35m"
-#define FG_CYAN             "\033[36m"
-#define FG_WHITE            "\033[37m"
-
-// Background colors
-#define BG_RED              "\033[41m"
-#define BG_YELLOW           "\033[43m"
-#define BG_BLUE             "\033[44m"
-#define BG_GRAY             "\033[100m"
-#define BG_WHITE            "\033[47m"
-
-// Common combinations
-#define STYLE_TAB_BAR       COLOR_REVERSE
-#define STYLE_TAB_CURRENT   COLOR_RESET BG_WHITE FG_BLACK
-#define STYLE_LINE_NUMBERS  FG_CYAN
-#define STYLE_QUIT_DIALOG   BG_RED
-#define STYLE_RELOAD_DIALOG BG_YELLOW
-#define STYLE_FILE_MGR_FOCUSED BG_BLUE
-#define STYLE_FILE_MGR_UNFOCUSED BG_GRAY
-#define STYLE_FILE_MGR_SELECTED BG_WHITE FG_BLACK
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -59,6 +27,7 @@ typedef struct {
     int line;              // 0-based line number
     DiagnosticSeverity severity;
     char *message;
+    char *source;
 } LineDiagnostic;
 
 // Stored semantic token for syntax highlighting
@@ -79,6 +48,12 @@ typedef struct {
 // FoldStyle is defined in editor_config.h as ConfigFoldStyle
 
 typedef struct {
+    char *name;
+    bool is_dir;
+    long size;
+} FileEntry;
+
+typedef struct {
     TextBuffer *buffer;
     int cursor_x, cursor_y;
     int offset_x, offset_y;
@@ -96,11 +71,16 @@ typedef struct {
     int diagnostic_count;
     int diagnostic_capacity;
     bool lsp_opened;  // Whether we've sent didOpen to LSP
+    int lsp_version;
+    char *lsp_name;
 
     // Semantic tokens for syntax highlighting
     StoredToken *tokens;
     int token_count;
     int token_capacity;
+    int *token_line_start;
+    int *token_line_count;
+    int token_line_capacity;
 
     // Code folding
     Fold *folds;
@@ -139,7 +119,7 @@ typedef struct {
     bool file_manager_overlay_mode; // true = overlay, false = reduce text width
     int file_manager_width;
     char *current_directory;
-    char **file_list;
+    FileEntry *file_list;
     int file_count;
     int file_capacity;
     int file_manager_cursor;
@@ -181,7 +161,7 @@ void draw_file_manager(void);
 void file_manager_navigate(int direction);
 void file_manager_select_item(void);
 void free_file_list(void);
-const char* get_file_size_str(const char* filepath);
+const char* get_file_size_str(long size, bool is_dir);
 bool is_directory(const char* filepath);
 bool has_unsaved_changes(void);
 void show_quit_confirmation(void);
@@ -244,6 +224,7 @@ int create_new_tab(const char* filename) {
     // Initialize new tab
     Tab* tab = &editor.tabs[editor.tab_count];
     memset(tab, 0, sizeof(Tab));
+    tab->lsp_version = 1;
     
     tab->buffer = buffer_create();
     if (!tab->buffer) return -1;
@@ -274,6 +255,10 @@ void free_tab(Tab* tab) {
     if (tab->filename) {
         free(tab->filename);
         tab->filename = NULL;
+    }
+    if (tab->lsp_name) {
+        free(tab->lsp_name);
+        tab->lsp_name = NULL;
     }
     clear_tab_diagnostics(tab);
     clear_tab_tokens(tab);
@@ -690,11 +675,17 @@ void move_cursor_word_left() {
 
 // Helper to find the token type at a given position (file coordinates)
 static SemanticTokenType get_token_at(Tab *tab, int line, int col) {
-    if (!tab || !tab->tokens) return TOKEN_UNKNOWN;
+    if (!tab || !tab->tokens || !tab->token_line_start || !tab->token_line_count) {
+        return TOKEN_UNKNOWN;
+    }
+    if (line < 0 || line >= tab->token_line_capacity) return TOKEN_UNKNOWN;
 
-    for (int i = 0; i < tab->token_count; i++) {
-        if (tab->tokens[i].line == line &&
-            col >= tab->tokens[i].col &&
+    int start = tab->token_line_start[line];
+    int count = tab->token_line_count[line];
+    if (start < 0 || count <= 0) return TOKEN_UNKNOWN;
+
+    for (int i = start; i < start + count; i++) {
+        if (col >= tab->tokens[i].col &&
             col < tab->tokens[i].col + tab->tokens[i].length) {
             return tab->tokens[i].type;
         }
@@ -702,12 +693,95 @@ static SemanticTokenType get_token_at(Tab *tab, int line, int col) {
     return TOKEN_UNKNOWN;
 }
 
+static void build_token_line_index(Tab *tab) {
+    if (!tab || !tab->buffer || tab->token_count == 0 || !tab->tokens) return;
+
+    int line_count = tab->buffer->line_count;
+    if (line_count <= 0) return;
+
+    if (tab->token_line_capacity < line_count) {
+        int *new_start = malloc(sizeof(int) * line_count);
+        int *new_count = malloc(sizeof(int) * line_count);
+        if (!new_start || !new_count) {
+            free(new_start);
+            free(new_count);
+            return;
+        }
+        free(tab->token_line_start);
+        free(tab->token_line_count);
+        tab->token_line_start = new_start;
+        tab->token_line_count = new_count;
+        tab->token_line_capacity = line_count;
+    }
+
+    for (int i = 0; i < line_count; i++) {
+        tab->token_line_start[i] = -1;
+        tab->token_line_count[i] = 0;
+    }
+
+    for (int i = 0; i < tab->token_count; i++) {
+        int line = tab->tokens[i].line;
+        if (line < 0 || line >= line_count) continue;
+        if (tab->token_line_start[line] == -1) {
+            tab->token_line_start[line] = i;
+        }
+        tab->token_line_count[line]++;
+    }
+}
+
+typedef struct {
+    char *data;
+    int len;
+    int cap;
+} RenderBuf;
+
+static void render_buf_init(RenderBuf *rb) {
+    rb->data = NULL;
+    rb->len = 0;
+    rb->cap = 0;
+}
+
+static void render_buf_free(RenderBuf *rb) {
+    free(rb->data);
+    rb->data = NULL;
+    rb->len = 0;
+    rb->cap = 0;
+}
+
+static bool render_buf_ensure(RenderBuf *rb, int extra) {
+    if (rb->len + extra + 1 <= rb->cap) return true;
+    int new_cap = rb->cap == 0 ? 256 : rb->cap * 2;
+    while (new_cap < rb->len + extra + 1) new_cap *= 2;
+    char *new_data = realloc(rb->data, new_cap);
+    if (!new_data) return false;
+    rb->data = new_data;
+    rb->cap = new_cap;
+    return true;
+}
+
+static void render_buf_append(RenderBuf *rb, const char *s) {
+    if (!s) return;
+    int n = strlen(s);
+    if (!render_buf_ensure(rb, n)) return;
+    memcpy(rb->data + rb->len, s, n);
+    rb->len += n;
+    rb->data[rb->len] = '\0';
+}
+
+static void render_buf_append_char(RenderBuf *rb, char c) {
+    if (!render_buf_ensure(rb, 1)) return;
+    rb->data[rb->len++] = c;
+    rb->data[rb->len] = '\0';
+}
+
 void draw_line(int screen_y, int file_y, int start_col) {
     Tab* tab = get_current_tab();
     if (!tab) return;
 
     terminal_set_cursor_position(screen_y + 2, start_col);
-    printf("\033[K");
+    RenderBuf rb;
+    render_buf_init(&rb);
+    render_buf_append(&rb, "\033[K");
 
     if (file_y < tab->buffer->line_count) {
         // Check for diagnostics on this line and color accordingly
@@ -725,15 +799,17 @@ void draw_line(int screen_y, int file_y, int start_col) {
         Fold *fold = get_fold_at_line(tab, file_y);
         if (fold) {
             if (fold->is_folded) {
-                printf(FG_YELLOW "▶" COLOR_RESET);
+                render_buf_append(&rb, FG_YELLOW "▶" COLOR_RESET);
             } else {
-                printf(FG_CYAN "▼" COLOR_RESET);
+                render_buf_append(&rb, FG_CYAN "▼" COLOR_RESET);
             }
         } else {
-            printf(" ");
+            render_buf_append(&rb, " ");
         }
 
-        printf("%s%6d" COLOR_RESET " ", line_num_color, file_y + 1);
+        char num_buf[32];
+        snprintf(num_buf, sizeof(num_buf), "%s%6d" COLOR_RESET " ", line_num_color, file_y + 1);
+        render_buf_append(&rb, num_buf);
 
         // Check if this line starts a folded region (reuse fold from above)
         if (fold && fold->is_folded) {
@@ -761,19 +837,23 @@ void draw_line(int screen_y, int file_y, int start_col) {
 
             // Apply selection highlighting if needed
             if (fold_has_selection) {
-                printf("\033[7m");  // Reverse video for selection
+                render_buf_append(&rb, "\033[7m");  // Reverse video for selection
             }
 
             // Print truncated line content
             int printed = 0;
             if (line) {
                 for (int i = 0; line[i] && printed < display_len; i++, printed++) {
-                    putchar(line[i]);
+                    render_buf_append_char(&rb, line[i]);
                 }
             }
 
             // Print fold indicator
-            printf(FG_YELLOW " ... (%d lines)" COLOR_RESET, folded_lines);
+            char fold_buf[64];
+            snprintf(fold_buf, sizeof(fold_buf), FG_YELLOW " ... (%d lines)" COLOR_RESET, folded_lines);
+            render_buf_append(&rb, fold_buf);
+            fwrite(rb.data, 1, rb.len, stdout);
+            render_buf_free(&rb);
             return;
         }
 
@@ -809,7 +889,9 @@ void draw_line(int screen_y, int file_y, int start_col) {
 
             // Handle empty line that's selected
             if (line_has_selection && len == 0) {
-                printf("\033[7m \033[0m");
+                render_buf_append(&rb, "\033[7m \033[0m");
+                fwrite(rb.data, 1, rb.len, stdout);
+                render_buf_free(&rb);
                 return;
             }
 
@@ -828,9 +910,9 @@ void draw_line(int screen_y, int file_y, int start_col) {
                 // Handle selection state change
                 if (char_selected != in_selection) {
                     if (char_selected) {
-                        printf("\033[7m"); // Start reverse video
+                        render_buf_append(&rb, "\033[7m"); // Start reverse video
                     } else {
-                        printf("\033[27m"); // End reverse video
+                        render_buf_append(&rb, "\033[27m"); // End reverse video
                     }
                     in_selection = char_selected;
                 }
@@ -845,29 +927,36 @@ void draw_line(int screen_y, int file_y, int start_col) {
                 // Apply color change if needed
                 if (new_color != current_color) {
                     if (new_color) {
-                        printf("%s", new_color);
+                        render_buf_append(&rb, new_color);
                     } else {
-                        printf(COLOR_RESET);
-                        if (in_selection) printf("\033[7m"); // Restore selection
+                        render_buf_append(&rb, COLOR_RESET);
+                        if (in_selection) render_buf_append(&rb, "\033[7m"); // Restore selection
                     }
                     current_color = new_color;
                 }
 
                 // Output the character
-                putchar(line[x]);
+                render_buf_append_char(&rb, line[x]);
             }
 
             // Reset formatting
-            printf(COLOR_RESET);
+            render_buf_append(&rb, COLOR_RESET);
 
             // Show selection extends to end of line
             if (line_has_selection && sel_end >= len && end_x >= len) {
-                printf("\033[7m \033[0m");
+                render_buf_append(&rb, "\033[7m \033[0m");
             }
         }
     } else {
-        printf(" \033[36m%6s\033[0m ", "~");  // Space for fold indicator column
+        char tilde_buf[32];
+        snprintf(tilde_buf, sizeof(tilde_buf), " %s%6s%s ", FG_CYAN, "~", COLOR_RESET);
+        render_buf_append(&rb, tilde_buf);  // Space for fold indicator column
     }
+
+    if (rb.data && rb.len > 0) {
+        fwrite(rb.data, 1, rb.len, stdout);
+    }
+    render_buf_free(&rb);
 }
 
 void draw_tab_bar() {
@@ -1018,6 +1107,7 @@ void draw_status_line() {
             int file_size = get_file_size();
             const char* size_str = format_file_size(file_size);
             const char* modified_str = tab->modified ? " [modified]" : "";
+            const char* lsp_str = (tab->lsp_opened && tab->lsp_name) ? tab->lsp_name : "off";
             
             // Check for diagnostic on current line
             const char *diag_msg = get_line_diagnostic_message(tab, tab->cursor_y);
@@ -1030,11 +1120,11 @@ void draw_status_line() {
                                       (sev == DIAG_INFO) ? "info" : "hint";
                 printf("[%s] %s", sev_str, diag_msg);
             } else if (editor.file_manager_visible && editor.file_manager_focused) {
-                printf("%s  Line %d/%d  %s%s  [FILE MANAGER - Esc to return]",
-                       filename, current_line, total_lines, size_str, modified_str);
+                printf("%s  Line %d/%d  %s%s  LSP:%s  [FILE MANAGER - Esc to return]",
+                       filename, current_line, total_lines, size_str, modified_str, lsp_str);
             } else {
-                printf("%s  Line %d/%d  %s%s",
-                       filename, current_line, total_lines, size_str, modified_str);
+                printf("%s  Line %d/%d  %s%s  LSP:%s",
+                       filename, current_line, total_lines, size_str, modified_str, lsp_str);
             }
         }
     }
@@ -2046,6 +2136,7 @@ void clear_tab_diagnostics(Tab *tab) {
     if (tab->diagnostics) {
         for (int i = 0; i < tab->diagnostic_count; i++) {
             free(tab->diagnostics[i].message);
+            free(tab->diagnostics[i].source);
         }
         free(tab->diagnostics);
         tab->diagnostics = NULL;
@@ -2077,19 +2168,40 @@ void lsp_diagnostics_handler(const char *uri, Diagnostic *diags, int count) {
         return;
     }
 
-    // Store new diagnostics
+    bool is_markdown = false;
+    if (tab->filename) {
+        const char *ext = strrchr(tab->filename, '.');
+        if (ext && (strcasecmp(ext, ".md") == 0 || strcasecmp(ext, ".markdown") == 0)) {
+            is_markdown = true;
+        }
+    }
+
+    // Store new diagnostics (filter noisy clangd errors for markdown)
     tab->diagnostics = calloc(count, sizeof(LineDiagnostic));
     if (!tab->diagnostics) return;
 
     tab->diagnostic_capacity = count;
-    tab->diagnostic_count = count;
+    tab->diagnostic_count = 0;
 
     for (int i = 0; i < count; i++) {
-        tab->diagnostics[i].line = diags[i].line;
-        tab->diagnostics[i].severity = diags[i].severity;
-        if (diags[i].message) {
-            tab->diagnostics[i].message = strdup(diags[i].message);
+        if (is_markdown) {
+            if (diags[i].source && strcmp(diags[i].source, "clangd") == 0) {
+                continue;
+            }
+            if (diags[i].message &&
+                strstr(diags[i].message, "expected exactly one compiler job") != NULL) {
+                continue;
+            }
         }
+        tab->diagnostics[tab->diagnostic_count].line = diags[i].line;
+        tab->diagnostics[tab->diagnostic_count].severity = diags[i].severity;
+        if (diags[i].message) {
+            tab->diagnostics[tab->diagnostic_count].message = strdup(diags[i].message);
+        }
+        if (diags[i].source) {
+            tab->diagnostics[tab->diagnostic_count].source = strdup(diags[i].source);
+        }
+        tab->diagnostic_count++;
     }
 
     editor.needs_full_redraw = true;
@@ -2102,25 +2214,33 @@ void notify_lsp_file_opened(Tab *tab) {
     const char *ext = strrchr(tab->filename, '.');
     if (!ext) return;
 
-    const char *command = editor_config_get_lsp_command(ext);
-    if (!command) return;
+    LanguageConfig *cfg = editor_config_get_for_extension(ext);
+    if (!cfg || !cfg->lsp_command) return;
+    const char *command = cfg->lsp_command;
 
-    // Initialize LSP server if not already running
-    if (!editor.lsp_enabled) {
-        editor.lsp_enabled = lsp_init(command);
-        if (editor.lsp_enabled) {
-            lsp_set_diagnostics_callback(lsp_diagnostics_handler);
-            lsp_set_semantic_tokens_callback(lsp_semantic_tokens_handler);
-        }
+    if (tab->lsp_name) {
+        free(tab->lsp_name);
+        tab->lsp_name = NULL;
+    }
+    if (cfg->name) {
+        tab->lsp_name = strdup(cfg->name);
     }
 
-    if (!editor.lsp_enabled) return;
+    // Initialize (or restart) LSP server for this language
+    editor.lsp_enabled = lsp_init(command);
+    if (editor.lsp_enabled) {
+        lsp_set_diagnostics_callback(lsp_diagnostics_handler);
+        lsp_set_semantic_tokens_callback(lsp_semantic_tokens_handler);
+    } else {
+        return;
+    }
 
     char *content = get_buffer_content(tab->buffer);
     if (content) {
-        lsp_did_open(tab->filename, content);
+        lsp_did_open(tab->filename, content, cfg->name);
         free(content);
         tab->lsp_opened = true;
+        tab->lsp_version = 1;
 
         // Request semantic tokens for syntax highlighting
         request_semantic_tokens(tab);
@@ -2132,7 +2252,8 @@ void notify_lsp_file_changed(Tab *tab) {
 
     char *content = get_buffer_content(tab->buffer);
     if (content) {
-        lsp_did_change(tab->filename, content);
+        tab->lsp_version++;
+        lsp_did_change(tab->filename, content, tab->lsp_version);
         free(content);
     }
 }
@@ -2142,6 +2263,11 @@ void notify_lsp_file_closed(Tab *tab) {
 
     lsp_did_close(tab->filename);
     tab->lsp_opened = false;
+    tab->lsp_version = 1;
+    if (tab->lsp_name) {
+        free(tab->lsp_name);
+        tab->lsp_name = NULL;
+    }
 }
 
 DiagnosticSeverity get_line_diagnostic_severity(Tab *tab, int line) {
@@ -2184,6 +2310,11 @@ void clear_tab_tokens(Tab *tab) {
     tab->tokens = NULL;
     tab->token_count = 0;
     tab->token_capacity = 0;
+    free(tab->token_line_start);
+    free(tab->token_line_count);
+    tab->token_line_start = NULL;
+    tab->token_line_count = NULL;
+    tab->token_line_capacity = 0;
 }
 
 // ============== Code Folding Implementation ==============
@@ -2617,6 +2748,8 @@ void lsp_semantic_tokens_handler(const char *uri, SemanticToken *tokens, int cou
         tab->tokens[i].type = tokens[i].type;
     }
 
+    build_token_line_index(tab);
+
     editor.needs_full_redraw = true;
 }
 
@@ -2660,19 +2793,11 @@ const char *get_token_color(SemanticTokenType type) {
     }
 }
 
-const char* get_file_size_str(const char* filepath) {
+const char* get_file_size_str(long size, bool is_dir) {
     static char size_str[32];
-    struct stat statbuf;
-    
-    if (stat(filepath, &statbuf) != 0) {
-        return "---";
-    }
-    
-    if (S_ISDIR(statbuf.st_mode)) {
+    if (is_dir) {
         return "<DIR>";
     }
-    
-    long size = statbuf.st_size;
     if (size < 1024) {
         snprintf(size_str, sizeof(size_str), "%ldB", size);
     } else if (size < 1024 * 1024) {
@@ -2686,9 +2811,7 @@ const char* get_file_size_str(const char* filepath) {
 void free_file_list(void) {
     if (editor.file_list) {
         for (int i = 0; i < editor.file_count; i++) {
-            if (editor.file_list[i]) {
-                free(editor.file_list[i]);
-            }
+            free(editor.file_list[i].name);
         }
         free(editor.file_list);
         editor.file_list = NULL;
@@ -2698,24 +2821,18 @@ void free_file_list(void) {
 }
 
 int file_list_compare(const void *a, const void *b) {
-    const char *name_a = *(const char **)a;
-    const char *name_b = *(const char **)b;
+    const FileEntry *entry_a = (const FileEntry *)a;
+    const FileEntry *entry_b = (const FileEntry *)b;
+    const char *name_a = entry_a->name;
+    const char *name_b = entry_b->name;
 
     // ".." always comes first
     if (strcmp(name_a, "..") == 0) return -1;
     if (strcmp(name_b, "..") == 0) return 1;
 
-    // Check if entries are directories
-    char path_a[1024], path_b[1024];
-    snprintf(path_a, sizeof(path_a), "%s/%s", editor.current_directory, name_a);
-    snprintf(path_b, sizeof(path_b), "%s/%s", editor.current_directory, name_b);
-
-    bool is_dir_a = is_directory(path_a);
-    bool is_dir_b = is_directory(path_b);
-
     // Directories come before files
-    if (is_dir_a && !is_dir_b) return -1;
-    if (!is_dir_a && is_dir_b) return 1;
+    if (entry_a->is_dir && !entry_b->is_dir) return -1;
+    if (!entry_a->is_dir && entry_b->is_dir) return 1;
 
     // Within same type, sort alphabetically (case-insensitive)
     return strcasecmp(name_a, name_b);
@@ -2744,7 +2861,7 @@ void refresh_file_list(void) {
 
     // Allocate array
     editor.file_capacity = count + 10; // Some extra space
-    editor.file_list = malloc(editor.file_capacity * sizeof(char*));
+    editor.file_list = malloc(editor.file_capacity * sizeof(FileEntry));
     if (!editor.file_list) {
         closedir(dir);
         return;
@@ -2754,15 +2871,32 @@ void refresh_file_list(void) {
     editor.file_count = 0;
     while ((entry = readdir(dir)) != NULL && editor.file_count < editor.file_capacity) {
         if (strcmp(entry->d_name, ".") == 0) continue; // Skip current dir
-        editor.file_list[editor.file_count] = strdup(entry->d_name);
-        editor.file_count++;
+        FileEntry *file_entry = &editor.file_list[editor.file_count];
+        file_entry->name = strdup(entry->d_name);
+        file_entry->is_dir = false;
+        file_entry->size = 0;
+
+        if (file_entry->name) {
+            if (strcmp(file_entry->name, "..") == 0) {
+                file_entry->is_dir = true;
+            } else {
+                char path[1024];
+                snprintf(path, sizeof(path), "%s/%s", editor.current_directory, file_entry->name);
+                struct stat statbuf;
+                if (stat(path, &statbuf) == 0) {
+                    file_entry->is_dir = S_ISDIR(statbuf.st_mode);
+                    file_entry->size = statbuf.st_size;
+                }
+            }
+            editor.file_count++;
+        }
     }
 
     closedir(dir);
 
     // Sort: ".." first, then directories, then files (alphabetically within each group)
     if (editor.file_count > 1) {
-        qsort(editor.file_list, editor.file_count, sizeof(char*), file_list_compare);
+        qsort(editor.file_list, editor.file_count, sizeof(FileEntry), file_list_compare);
     }
 
     // Reset cursor position
@@ -2813,14 +2947,15 @@ void file_manager_select_item(void) {
     if (!editor.file_manager_visible || editor.file_count == 0) return;
     if (editor.file_manager_cursor >= editor.file_count) return;
     
-    char *selected = editor.file_list[editor.file_manager_cursor];
-    if (!selected) return;
+    FileEntry *selected_entry = &editor.file_list[editor.file_manager_cursor];
+    if (!selected_entry || !selected_entry->name) return;
+    char *selected = selected_entry->name;
     
     // Build full path
     char full_path[1024];
     snprintf(full_path, sizeof(full_path), "%s/%s", editor.current_directory, selected);
     
-    if (is_directory(full_path)) {
+    if (selected_entry->is_dir || is_directory(full_path)) {
         // Navigate to directory
         if (strcmp(selected, "..") == 0) {
             // Go up one directory
@@ -2887,12 +3022,11 @@ void draw_file_manager(void) {
         
         // Draw file entry if available
         int file_index = y + editor.file_manager_offset;
-        if (file_index < editor.file_count && editor.file_list[file_index]) {
+        if (file_index < editor.file_count) {
             terminal_set_cursor_position(y + 2, start_col);
-            
-            char *filename = editor.file_list[file_index];
-            char full_path[1024];
-            snprintf(full_path, sizeof(full_path), "%s/%s", editor.current_directory, filename);
+            FileEntry *entry = &editor.file_list[file_index];
+            if (entry->name) {
+                char *filename = entry->name;
             
             // Highlight current selection
             if (file_index == editor.file_manager_cursor) {
@@ -2908,7 +3042,8 @@ void draw_file_manager(void) {
             }
             
             // Show size or <DIR>
-            printf(" %6s", get_file_size_str(full_path));
+                printf(" %6s", get_file_size_str(entry->size, entry->is_dir));
+            }
         }
         
         printf("\033[0m"); // Reset formatting

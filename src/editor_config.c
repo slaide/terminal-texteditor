@@ -184,6 +184,7 @@ static void add_defaults(void) {
         "    },"
         "    \"markdown\": {"
         "      \"extensions\": [\".md\", \".markdown\"],"
+        "      \"lsp\": \"./md-lsp\","
         "      \"fold\": \"headings\""
         "    }"
         "  }"
