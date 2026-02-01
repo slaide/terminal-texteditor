@@ -47,6 +47,7 @@ static long long monotonic_ms(void) {
 }
 
 #define HOVER_DELAY_MS 250
+#define SEMANTIC_TOKENS_DELAY_MS 150
 
 Editor editor = {0};
 
@@ -91,6 +92,8 @@ static void clear_hover(void);
 static void schedule_hover_request(int buffer_line, int buffer_col, int screen_x, int screen_y);
 static void process_hover_request(void);
 static void get_cursor_screen_pos(Tab *tab, int *out_row, int *out_col);
+static void schedule_semantic_tokens(Tab *tab);
+static void process_semantic_tokens_requests(void);
 void signal_handler(int sig);
 void process_resize(void);
 void scroll_if_needed(void);
@@ -268,6 +271,7 @@ void notify_lsp_file_changed(Tab *tab) {
         tab->lsp_version++;
         lsp_did_change(tab->filename, content, tab->lsp_version);
         free(content);
+        schedule_semantic_tokens(tab);
     }
 }
 
@@ -948,6 +952,29 @@ void request_semantic_tokens(Tab *tab) {
     lsp_request_semantic_tokens(tab->filename);
 }
 
+static void schedule_semantic_tokens(Tab *tab) {
+    if (!tab || !editor.lsp_enabled || !tab->lsp_opened) return;
+    tab->tokens_pending = true;
+    tab->tokens_last_change_ms = monotonic_ms();
+}
+
+static void process_semantic_tokens_requests(void) {
+    if (!editor.lsp_enabled) return;
+    for (int i = 0; i < editor.tab_count; i++) {
+        Tab *tab = &editor.tabs[i];
+        if (!tab->tokens_pending) continue;
+        if (!tab->lsp_opened || !tab->filename) {
+            tab->tokens_pending = false;
+            continue;
+        }
+        if (monotonic_ms() - tab->tokens_last_change_ms < SEMANTIC_TOKENS_DELAY_MS) {
+            continue;
+        }
+        tab->tokens_pending = false;
+        request_semantic_tokens(tab);
+    }
+}
+
 static void clear_hover(void) {
     if (editor.hover_text) {
         free(editor.hover_text);
@@ -1153,6 +1180,7 @@ int main(int argc, char *argv[]) {
         process_resize();
         scroll_if_needed();
         process_hover_request();
+        process_semantic_tokens_requests();
         if (editor.hover_request_active &&
             (monotonic_ms() - editor.hover_request_ms > 1000)) {
             editor.hover_request_active = false;

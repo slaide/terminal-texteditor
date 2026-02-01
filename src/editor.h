@@ -67,6 +67,8 @@ typedef struct {
     int *token_line_start;
     int *token_line_count;
     int token_line_capacity;
+    bool tokens_pending;
+    long long tokens_last_change_ms;
 
     // Code folding
     Fold *folds;
