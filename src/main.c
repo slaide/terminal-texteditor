@@ -4,11 +4,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <ctype.h>
 #include <termios.h>
 #include <sys/ioctl.h>
 #include <signal.h>
-#include <errno.h>
-#include <ctype.h>
 #include <time.h>
 #include <stdarg.h>
 #include <sys/select.h>
@@ -807,6 +806,62 @@ static void get_cursor_screen_pos(Tab *tab, int *out_row, int *out_col) {
     *out_col = screen_col;
 }
 
+static const char *skip_spaces(const char *s) {
+    while (s && *s && isspace((unsigned char)*s)) s++;
+    return s;
+}
+
+static char *build_hover_header(const char *text, int line, int col) {
+    if (!text) return NULL;
+
+    const char *p = text;
+    const char *first_line_start = NULL;
+    const char *first_line_end = NULL;
+
+    while (p && *p) {
+        const char *next = strchr(p, '\n');
+        int len = next ? (int)(next - p) : (int)strlen(p);
+        const char *trim = skip_spaces(p);
+        if (len > 0 && *trim != '\0') {
+            first_line_start = p;
+            first_line_end = p + len;
+            break;
+        }
+        if (!next) break;
+        p = next + 1;
+    }
+
+    char kind[64] = {0};
+    char name[128] = {0};
+    if (first_line_start && first_line_end && first_line_end > first_line_start) {
+        const char *space = memchr(first_line_start, ' ', (size_t)(first_line_end - first_line_start));
+        if (space) {
+            int kind_len = (int)(space - first_line_start);
+            if (kind_len > 0 && kind_len < (int)sizeof(kind)) {
+                memcpy(kind, first_line_start, kind_len);
+                kind[kind_len] = '\0';
+                const char *name_start = skip_spaces(space + 1);
+                int name_len = (int)(first_line_end - name_start);
+                if (name_len > 0) {
+                    if (name_len >= (int)sizeof(name)) name_len = (int)sizeof(name) - 1;
+                    memcpy(name, name_start, name_len);
+                    name[name_len] = '\0';
+                }
+            }
+        }
+    }
+
+    char header[256];
+    if (name[0] != '\0' && kind[0] != '\0') {
+        snprintf(header, sizeof(header), "Symbol: %s (%s)\nLocation: line %d, col %d",
+                 name, kind, line + 1, col + 1);
+    } else {
+        snprintf(header, sizeof(header), "Location: line %d, col %d", line + 1, col + 1);
+    }
+
+    return strdup(header);
+}
+
 static bool contains_word_before(const char *text, const char *end, const char *word) {
     if (!text || !end || !word) return false;
     size_t word_len = strlen(word);
@@ -1048,7 +1103,18 @@ void lsp_hover_handler(const char *uri, int line, int col, const char *text) {
         return;
     }
 
-    char *augmented = append_hover_members(text);
+    char *header = build_hover_header(text, line, col);
+    char *combined = NULL;
+    if (header) {
+        int total_len = (int)strlen(header) + 2 + (int)strlen(text) + 1;
+        combined = malloc((size_t)total_len);
+        if (combined) {
+            snprintf(combined, (size_t)total_len, "%s\n\n%s", header, text);
+        }
+        free(header);
+    }
+    char *augmented = append_hover_members(combined ? combined : text);
+    if (combined) free(combined);
     editor.hover_text = augmented ? augmented : strdup(text);
     editor.hover_active = editor.hover_text != NULL;
     editor.needs_full_redraw = true;
