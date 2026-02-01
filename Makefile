@@ -13,7 +13,7 @@ else
     BUILD_DIR = build/debug
 endif
 
-SOURCES = src/main.c src/render.c src/file_manager.c src/terminal.c src/buffer.c src/clipboard.c src/json.c src/lsp.c src/editor_config.c
+SOURCES = src/main.c src/editor_app.c src/editor_tabs.c src/editor_files.c src/editor_search.c src/editor_selection.c src/editor_cursor.c src/editor_folds.c src/editor_mouse.c src/editor_hover.c src/render.c src/file_manager.c src/terminal.c src/buffer.c src/clipboard.c src/json.c src/lsp.c src/editor_config.c src/lsp_integration.c
 OBJECTS = $(patsubst src/%.c,$(BUILD_DIR)/%.o,$(SOURCES))
 
 .PHONY: all clean install
