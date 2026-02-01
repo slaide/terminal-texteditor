@@ -134,6 +134,12 @@ typedef struct {
     long long hover_last_move_ms;
     long long hover_request_ms;
     bool hover_request_active;
+    long long last_click_ms;
+    int last_click_x, last_click_y;
+    bool word_select_active;
+    int word_anchor_line;
+    int word_anchor_start;
+    int word_anchor_end;
 } Editor;
 
 extern Editor editor;

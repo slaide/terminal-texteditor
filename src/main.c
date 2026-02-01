@@ -47,6 +47,7 @@ static long long monotonic_ms(void) {
 
 #define HOVER_DELAY_MS 250
 #define SEMANTIC_TOKENS_DELAY_MS 150
+#define DOUBLE_CLICK_MS 400
 
 Editor editor = {0};
 
@@ -93,6 +94,8 @@ static void process_hover_request(void);
 static void get_cursor_screen_pos(Tab *tab, int *out_row, int *out_col);
 static void schedule_semantic_tokens(Tab *tab);
 static void process_semantic_tokens_requests(void);
+static void get_word_bounds_at(Tab *tab, int line, int col, int *out_start, int *out_end);
+bool is_word_char(char c);
 void signal_handler(int sig);
 void process_resize(void);
 void scroll_if_needed(void);
@@ -875,6 +878,42 @@ static bool contains_word_before(const char *text, const char *end, const char *
         p = match + word_len;
     }
     return false;
+}
+
+static void get_word_bounds_at(Tab *tab, int line, int col, int *out_start, int *out_end) {
+    if (!out_start || !out_end) return;
+    *out_start = col;
+    *out_end = col;
+    if (!tab || !tab->buffer || line < 0 || line >= tab->buffer->line_count) return;
+
+    char *text = tab->buffer->lines[line];
+    if (!text) return;
+
+    int len = (int)strlen(text);
+    if (len == 0) return;
+
+    int idx = col;
+    if (idx >= len) idx = len - 1;
+    if (idx < 0) idx = 0;
+
+    if (!is_word_char(text[idx])) {
+        if (idx > 0 && is_word_char(text[idx - 1])) {
+            idx = idx - 1;
+        } else if (idx + 1 < len && is_word_char(text[idx + 1])) {
+            idx = idx + 1;
+        } else {
+            *out_start = idx;
+            *out_end = idx + 1;
+            return;
+        }
+    }
+
+    int start = idx;
+    int end = idx + 1;
+    while (start > 0 && is_word_char(text[start - 1])) start--;
+    while (end < len && is_word_char(text[end])) end++;
+    *out_start = start;
+    *out_end = end;
 }
 
 static void extract_last_identifier(const char *s, char *out, size_t out_sz) {
@@ -2623,6 +2662,7 @@ void handle_mouse(int button, int x, int y, int pressed) {
 
     // Handle clicks on tab bar
     if (y == 1 && button == 0 && pressed) {
+        editor.word_select_active = false;
         // Calculate tab bar start position
         int tab_start_col = 1;
         if (editor.file_manager_visible && !editor.file_manager_overlay_mode) {
@@ -2675,6 +2715,7 @@ void handle_mouse(int button, int x, int y, int pressed) {
     // Check if click is in file manager area
     if (editor.file_manager_visible && x <= file_manager_end) {
         if (button == 0 && pressed) {
+            editor.word_select_active = false;
             // Focus file manager
             if (!editor.file_manager_focused) {
                 editor.file_manager_focused = true;
@@ -2748,20 +2789,49 @@ void handle_mouse(int button, int x, int y, int pressed) {
             if (buffer_x > line_len) buffer_x = line_len;
             if (buffer_x < 0) buffer_x = 0;
             
+            long long now = monotonic_ms();
+            bool is_double_click = (now - editor.last_click_ms <= DOUBLE_CLICK_MS) &&
+                                   (editor.last_click_x == x) &&
+                                   (editor.last_click_y == y);
+            editor.last_click_ms = now;
+            editor.last_click_x = x;
+            editor.last_click_y = y;
+
             tab->cursor_x = buffer_x;
             tab->cursor_y = buffer_y;
             editor.mouse_dragging = true;
             editor.mouse_drag_start_x = buffer_x;
             editor.mouse_drag_start_y = buffer_y;
-            
+
             // Clear any existing selection on click
             clear_selection();
             clear_hover();
             editor.hover_pending = false;
+
+            if (is_double_click) {
+                int word_start = buffer_x;
+                int word_end = buffer_x + 1;
+                get_word_bounds_at(tab, buffer_y, buffer_x, &word_start, &word_end);
+                tab->select_start_x = word_start;
+                tab->select_start_y = buffer_y;
+                tab->select_end_x = word_end;
+                tab->select_end_y = buffer_y;
+                tab->selecting = true;
+                editor.word_select_active = true;
+                editor.word_anchor_line = buffer_y;
+                editor.word_anchor_start = word_start;
+                editor.word_anchor_end = word_end;
+                editor.needs_full_redraw = true;
+            } else {
+                editor.word_select_active = false;
+            }
         } else {
             // Mouse button released - end drag operation
             if (editor.mouse_dragging) {
                 editor.mouse_dragging = false;
+            }
+            if (!editor.mouse_dragging) {
+                editor.word_select_active = false;
             }
         }
     } else if (button == 32) {  // Mouse drag event (button held and moving)
@@ -2785,14 +2855,39 @@ void handle_mouse(int button, int x, int y, int pressed) {
             if (buffer_x > line_len) buffer_x = line_len;
             if (buffer_x < 0) buffer_x = 0;
             
-            // Start selection on first drag movement
-            if (!tab->selecting) {
-                start_selection();
+            if (editor.word_select_active) {
+                int word_start = buffer_x;
+                int word_end = buffer_x + 1;
+                get_word_bounds_at(tab, buffer_y, buffer_x, &word_start, &word_end);
+
+                tab->selecting = true;
+                if (buffer_y > editor.word_anchor_line ||
+                    (buffer_y == editor.word_anchor_line && word_end >= editor.word_anchor_end)) {
+                    tab->select_start_x = editor.word_anchor_start;
+                    tab->select_start_y = editor.word_anchor_line;
+                    tab->select_end_x = word_end;
+                    tab->select_end_y = buffer_y;
+                    tab->cursor_x = word_end;
+                    tab->cursor_y = buffer_y;
+                } else {
+                    tab->select_start_x = word_start;
+                    tab->select_start_y = buffer_y;
+                    tab->select_end_x = editor.word_anchor_end;
+                    tab->select_end_y = editor.word_anchor_line;
+                    tab->cursor_x = word_start;
+                    tab->cursor_y = buffer_y;
+                }
+                editor.needs_full_redraw = true;
+            } else {
+                // Start selection on first drag movement
+                if (!tab->selecting) {
+                    start_selection();
+                }
+                
+                tab->cursor_x = buffer_x;
+                tab->cursor_y = buffer_y;
+                update_selection();
             }
-            
-            tab->cursor_x = buffer_x;
-            tab->cursor_y = buffer_y;
-            update_selection();
         }
     }
 }
