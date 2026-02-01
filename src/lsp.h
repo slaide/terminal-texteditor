@@ -66,6 +66,9 @@ typedef struct {
 // Callback for semantic tokens
 typedef void (*lsp_semantic_tokens_callback)(const char *uri, SemanticToken *tokens, int count);
 
+// Callback for hover info
+typedef void (*lsp_hover_callback)(const char *uri, int line, int col, const char *text);
+
 // Lifecycle
 bool lsp_init(const char *command);  // Spawn LSP server with given command
 void lsp_shutdown(void);
@@ -86,6 +89,11 @@ void lsp_set_diagnostics_callback(lsp_diagnostics_callback cb);
 // Semantic tokens
 void lsp_set_semantic_tokens_callback(lsp_semantic_tokens_callback cb);
 void lsp_request_semantic_tokens(const char *path);
+
+// Hover
+void lsp_set_hover_callback(lsp_hover_callback cb);
+void lsp_request_hover(const char *path, int line, int col);
+bool lsp_hover_is_supported(void);
 
 // Helper to convert file path to URI
 char *lsp_path_to_uri(const char *path);

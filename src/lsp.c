@@ -12,9 +12,17 @@
 #include <sys/wait.h>
 
 // Pending request tracking
+typedef enum {
+    REQ_SEMANTIC_TOKENS,
+    REQ_HOVER
+} PendingRequestType;
+
 typedef struct {
     int id;
-    char *uri;  // For semantic tokens, track which file
+    char *uri;  // For semantic tokens and hover, track which file
+    PendingRequestType type;
+    int line;
+    int col;
 } PendingRequest;
 
 // LSP client state
@@ -28,6 +36,8 @@ static struct {
     char *command;
     lsp_diagnostics_callback diagnostics_cb;
     lsp_semantic_tokens_callback semantic_cb;
+    lsp_hover_callback hover_cb;
+    bool hover_supported;
 
     // Read buffer for incoming messages
     char *read_buf;
@@ -49,7 +59,7 @@ static bool send_message(JsonValue *msg);
 static void handle_message(JsonValue *msg);
 
 // Add a pending request
-static void add_pending_request(int id, const char *uri) {
+static void add_pending_request(int id, const char *uri, PendingRequestType type, int line, int col) {
     if (lsp.pending_count >= lsp.pending_capacity) {
         int new_cap = lsp.pending_capacity == 0 ? 8 : lsp.pending_capacity * 2;
         PendingRequest *new_pending = realloc(lsp.pending, new_cap * sizeof(PendingRequest));
@@ -59,23 +69,28 @@ static void add_pending_request(int id, const char *uri) {
     }
     lsp.pending[lsp.pending_count].id = id;
     lsp.pending[lsp.pending_count].uri = uri ? strdup(uri) : NULL;
+    lsp.pending[lsp.pending_count].type = type;
+    lsp.pending[lsp.pending_count].line = line;
+    lsp.pending[lsp.pending_count].col = col;
     lsp.pending_count++;
 }
 
 // Find and remove a pending request by ID
-static char *pop_pending_request(int id) {
+static bool pop_pending_request(int id, PendingRequest *out) {
     for (int i = 0; i < lsp.pending_count; i++) {
         if (lsp.pending[i].id == id) {
-            char *uri = lsp.pending[i].uri;
+            if (out) {
+                *out = lsp.pending[i];
+            }
             // Remove by shifting
             for (int j = i; j < lsp.pending_count - 1; j++) {
                 lsp.pending[j] = lsp.pending[j + 1];
             }
             lsp.pending_count--;
-            return uri;
+            return true;
         }
     }
-    return NULL;
+    return false;
 }
 
 // Map clangd token type string to our enum
@@ -235,6 +250,111 @@ static void handle_semantic_tokens_response(const char *uri, JsonValue *result) 
     free(tokens);
 }
 
+static void append_text(char **buf, int *len, int *cap, const char *text) {
+    if (!text || !buf || !len || !cap) return;
+    int add_len = (int)strlen(text);
+    if (add_len == 0) return;
+    if (*len + add_len + 1 > *cap) {
+        int new_cap = *cap == 0 ? 128 : *cap;
+        while (new_cap < *len + add_len + 1) new_cap *= 2;
+        char *new_buf = realloc(*buf, new_cap);
+        if (!new_buf) return;
+        *buf = new_buf;
+        *cap = new_cap;
+    }
+    memcpy(*buf + *len, text, add_len);
+    *len += add_len;
+    (*buf)[*len] = '\0';
+}
+
+static void append_segment(char **buf, int *len, int *cap, const char *text) {
+    if (!text || !buf || !len || !cap) return;
+    if (*len > 0 && (*buf)[*len - 1] != '\n') {
+        append_text(buf, len, cap, "\n");
+    }
+    append_text(buf, len, cap, text);
+}
+
+static char *strip_markdown_fences(const char *text) {
+    if (!text) return NULL;
+    char *out = NULL;
+    int len = 0;
+    int cap = 0;
+    const char *line = text;
+    while (line && *line) {
+        const char *next = strchr(line, '\n');
+        int line_len = next ? (int)(next - line) : (int)strlen(line);
+        bool fence = (line_len >= 3 && strncmp(line, "```", 3) == 0);
+        if (!fence) {
+            if (len > 0) append_text(&out, &len, &cap, "\n");
+            if (line_len > 0) {
+                char *tmp = strndup(line, line_len);
+                if (tmp) {
+                    append_text(&out, &len, &cap, tmp);
+                    free(tmp);
+                }
+            }
+        }
+        if (!next) break;
+        line = next + 1;
+    }
+    return out;
+}
+
+static void append_marked_string(char **buf, int *len, int *cap, JsonValue *val) {
+    if (!val) return;
+    if (val->type == JSON_STRING) {
+        append_segment(buf, len, cap, json_get_string(val));
+        return;
+    }
+    if (val->type == JSON_OBJECT) {
+        JsonValue *value = json_object_get(val, "value");
+        if (value && value->type == JSON_STRING) {
+            append_segment(buf, len, cap, json_get_string(value));
+        }
+    }
+}
+
+static char *hover_contents_to_text(JsonValue *contents) {
+    if (!contents) return NULL;
+    char *out = NULL;
+    int len = 0;
+    int cap = 0;
+
+    if (contents->type == JSON_STRING) {
+        append_segment(&out, &len, &cap, json_get_string(contents));
+        return out;
+    }
+    if (contents->type == JSON_ARRAY) {
+        int count = json_array_length(contents);
+        for (int i = 0; i < count; i++) {
+            JsonValue *item = json_array_get(contents, i);
+            append_marked_string(&out, &len, &cap, item);
+        }
+        return out;
+    }
+    if (contents->type == JSON_OBJECT) {
+        JsonValue *kind = json_object_get(contents, "kind");
+        JsonValue *value = json_object_get(contents, "value");
+        const char *kind_str = kind ? json_get_string(kind) : NULL;
+        const char *value_str = value ? json_get_string(value) : NULL;
+        if (value_str && kind_str && strcmp(kind_str, "markdown") == 0) {
+            char *stripped = strip_markdown_fences(value_str);
+            if (stripped) {
+                append_segment(&out, &len, &cap, stripped);
+                free(stripped);
+                return out;
+            }
+        }
+        if (value_str) {
+            append_segment(&out, &len, &cap, value_str);
+        }
+        return out;
+    }
+
+    return out;
+}
+
 static void handle_diagnostics(JsonValue *params) {
     if (!params || !lsp.diagnostics_cb) return;
 
@@ -309,6 +429,27 @@ static void handle_diagnostics(JsonValue *params) {
     free(diags);
 }
 
+static void handle_hover_response(const PendingRequest *req, JsonValue *result) {
+    if (!req || !lsp.hover_cb) return;
+    if (!result) {
+        lsp.hover_cb(req->uri, req->line, req->col, NULL);
+        return;
+    }
+    JsonValue *contents = json_object_get(result, "contents");
+    if (!contents) {
+        lsp.hover_cb(req->uri, req->line, req->col, NULL);
+        return;
+    }
+    char *text = hover_contents_to_text(contents);
+    if (!text || text[0] == '\0') {
+        free(text);
+        lsp.hover_cb(req->uri, req->line, req->col, NULL);
+        return;
+    }
+    lsp.hover_cb(req->uri, req->line, req->col, text);
+    free(text);
+}
+
 static void handle_message(JsonValue *msg) {
     if (!msg) return;
 
@@ -330,12 +471,28 @@ static void handle_message(JsonValue *msg) {
     if (id) {
         int req_id = (int)json_get_number(id);
         JsonValue *result = json_object_get(msg, "result");
+        JsonValue *error = json_object_get(msg, "error");
+        const char *error_msg = NULL;
+        if (error && error->type == JSON_OBJECT) {
+            JsonValue *err_message = json_object_get(error, "message");
+            if (err_message && err_message->type == JSON_STRING) {
+                error_msg = json_get_string(err_message);
+            }
+        }
 
         // Check if this is the initialize response
         if (req_id == 1 && result) {
             // Parse semantic token legend from capabilities
             JsonValue *caps = json_object_get(result, "capabilities");
             if (caps) {
+                JsonValue *hoverProvider = json_object_get(caps, "hoverProvider");
+                if (hoverProvider) {
+                    if (hoverProvider->type == JSON_BOOL) {
+                        lsp.hover_supported = json_get_bool(hoverProvider);
+                    } else if (hoverProvider->type == JSON_OBJECT) {
+                        lsp.hover_supported = true;
+                    }
+                }
                 JsonValue *semTokens = json_object_get(caps, "semanticTokensProvider");
                 if (semTokens) {
                     JsonValue *legend = json_object_get(semTokens, "legend");
@@ -355,13 +512,22 @@ static void handle_message(JsonValue *msg) {
             }
         }
 
-        // Check if this is a semantic tokens response
-        char *uri = pop_pending_request(req_id);
-        if (uri && result) {
-            handle_semantic_tokens_response(uri, result);
-            free(uri);
-        } else if (uri) {
-            free(uri);
+        PendingRequest req = {0};
+        if (pop_pending_request(req_id, &req)) {
+            if (req.type == REQ_SEMANTIC_TOKENS) {
+                if (req.uri && result) {
+                    handle_semantic_tokens_response(req.uri, result);
+                }
+            } else if (req.type == REQ_HOVER) {
+                if (!result && error_msg && lsp.hover_cb) {
+                    char buf[256];
+                    snprintf(buf, sizeof(buf), "Hover error: %s", error_msg);
+                    lsp.hover_cb(req.uri, req.line, req.col, buf);
+                } else {
+                    handle_hover_response(&req, result);
+                }
+            }
+            if (req.uri) free(req.uri);
         }
     }
 }
@@ -555,6 +721,14 @@ bool lsp_init(const char *command) {
     JsonValue *diagCaps = json_object();
     json_object_set(diagCaps, "relatedInformation", json_bool(true));
     json_object_set(textDocCaps, "publishDiagnostics", diagCaps);
+
+    JsonValue *hoverCaps = json_object();
+    json_object_set(hoverCaps, "dynamicRegistration", json_bool(false));
+    JsonValue *hoverFormats = json_array();
+    json_array_push(hoverFormats, json_string("plaintext"));
+    json_array_push(hoverFormats, json_string("markdown"));
+    json_object_set(hoverCaps, "contentFormat", hoverFormats);
+    json_object_set(textDocCaps, "hover", hoverCaps);
 
     // Semantic tokens capability
     JsonValue *semTokenCaps = json_object();
@@ -794,6 +968,10 @@ void lsp_set_semantic_tokens_callback(lsp_semantic_tokens_callback cb) {
     lsp.semantic_cb = cb;
 }
 
+void lsp_set_hover_callback(lsp_hover_callback cb) {
+    lsp.hover_cb = cb;
+}
+
 void lsp_request_semantic_tokens(const char *path) {
     if (!lsp.running || !path) return;
 
@@ -809,9 +987,38 @@ void lsp_request_semantic_tokens(const char *path) {
     JsonValue *req = create_request("textDocument/semanticTokens/full", params);
 
     // Track this request so we can match the response
-    add_pending_request(lsp.request_id, uri);
+    add_pending_request(lsp.request_id, uri, REQ_SEMANTIC_TOKENS, -1, -1);
 
     send_message(req);
     json_free(req);
     free(uri);
+}
+
+void lsp_request_hover(const char *path, int line, int col) {
+    if (!lsp.running || !path) return;
+
+    char *uri = lsp_path_to_uri(path);
+    if (!uri) return;
+
+    JsonValue *params = json_object();
+    JsonValue *textDoc = json_object();
+    JsonValue *pos = json_object();
+
+    json_object_set(textDoc, "uri", json_string(uri));
+    json_object_set(pos, "line", json_number(line));
+    json_object_set(pos, "character", json_number(col));
+    json_object_set(params, "textDocument", textDoc);
+    json_object_set(params, "position", pos);
+
+    JsonValue *req = create_request("textDocument/hover", params);
+
+    add_pending_request(lsp.request_id, uri, REQ_HOVER, line, col);
+
+    send_message(req);
+    json_free(req);
+    free(uri);
+}
+
+bool lsp_hover_is_supported(void) {
+    return lsp.hover_supported;
 }

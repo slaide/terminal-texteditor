@@ -40,6 +40,14 @@ static bool frame_due(struct timespec *last_frame, int target_ms) {
     return false;
 }
 
+static long long monotonic_ms(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (long long)now.tv_sec * 1000LL + (long long)(now.tv_nsec / 1000000LL);
+}
+
+#define HOVER_DELAY_MS 250
+
 Editor editor = {0};
 
 
@@ -78,6 +86,11 @@ void lsp_semantic_tokens_handler(const char *uri, SemanticToken *tokens, int cou
 void clear_tab_tokens(Tab *tab);
 void request_semantic_tokens(Tab *tab);
 const char *get_token_color(SemanticTokenType type);
+void lsp_hover_handler(const char *uri, int line, int col, const char *text);
+static void clear_hover(void);
+static void schedule_hover_request(int buffer_line, int buffer_col, int screen_x, int screen_y);
+static void process_hover_request(void);
+static void get_cursor_screen_pos(Tab *tab, int *out_row, int *out_col);
 void signal_handler(int sig);
 void process_resize(void);
 void scroll_if_needed(void);
@@ -230,6 +243,7 @@ void notify_lsp_file_opened(Tab *tab) {
     if (editor.lsp_enabled) {
         lsp_set_diagnostics_callback(lsp_diagnostics_handler);
         lsp_set_semantic_tokens_callback(lsp_semantic_tokens_handler);
+        lsp_set_hover_callback(lsp_hover_handler);
     } else {
         return;
     }
@@ -746,6 +760,147 @@ static void build_token_line_index(Tab *tab) {
     }
 }
 
+static void append_str(char **buf, int *len, int *cap, const char *text) {
+    if (!text || !buf || !len || !cap) return;
+    int add_len = (int)strlen(text);
+    if (add_len == 0) return;
+    if (*len + add_len + 1 > *cap) {
+        int new_cap = *cap == 0 ? 128 : *cap;
+        while (new_cap < *len + add_len + 1) new_cap *= 2;
+        char *new_buf = realloc(*buf, new_cap);
+        if (!new_buf) return;
+        *buf = new_buf;
+        *cap = new_cap;
+    }
+    memcpy(*buf + *len, text, add_len);
+    *len += add_len;
+    (*buf)[*len] = '\0';
+}
+
+static void get_cursor_screen_pos(Tab *tab, int *out_row, int *out_col) {
+    if (!tab || !out_row || !out_col) return;
+
+    int text_start_col = 1;
+    if (editor.file_manager_visible && !editor.file_manager_overlay_mode) {
+        text_start_col += editor.file_manager_width + 1; // +1 for border
+    }
+
+    int visible_lines = 0;
+    for (int y = tab->offset_y; y < tab->cursor_y; y++) {
+        if (is_line_visible(tab, y)) {
+            visible_lines++;
+        }
+    }
+
+    int screen_row = visible_lines + 2;  // +2 for tab bar
+    int screen_col = (tab->cursor_x - tab->offset_x) + text_start_col + editor.line_number_width;
+
+    if (screen_row < 2) screen_row = 2;
+    if (screen_row >= editor.screen_rows) screen_row = editor.screen_rows - 1;
+    if (screen_col < text_start_col + 7) screen_col = text_start_col + 7;
+
+    *out_row = screen_row;
+    *out_col = screen_col;
+}
+
+static bool contains_word_before(const char *text, const char *end, const char *word) {
+    if (!text || !end || !word) return false;
+    size_t word_len = strlen(word);
+    const char *p = text;
+    while (p && p + word_len <= end) {
+        const char *match = strstr(p, word);
+        if (!match || match + word_len > end) return false;
+        bool left_ok = (match == text) || !isalnum((unsigned char)match[-1]);
+        bool right_ok = (match + word_len >= end) || !isalnum((unsigned char)match[word_len]);
+        if (left_ok && right_ok) return true;
+        p = match + word_len;
+    }
+    return false;
+}
+
+static void extract_last_identifier(const char *s, char *out, size_t out_sz) {
+    if (!s || !out || out_sz == 0) return;
+    out[0] = '\0';
+    int len = (int)strlen(s);
+    int i = len - 1;
+    while (i >= 0 && !(isalnum((unsigned char)s[i]) || s[i] == '_')) i--;
+    if (i < 0) return;
+    int end = i;
+    while (i >= 0 && (isalnum((unsigned char)s[i]) || s[i] == '_')) i--;
+    int start = i + 1;
+    int id_len = end - start + 1;
+    if (id_len <= 0) return;
+    if ((size_t)id_len >= out_sz) id_len = (int)out_sz - 1;
+    memcpy(out, s + start, id_len);
+    out[id_len] = '\0';
+}
+
+static char *append_hover_members(const char *text) {
+    if (!text) return NULL;
+    const char *brace = strchr(text, '{');
+    if (!brace) return strdup(text);
+    const char *end = strchr(brace + 1, '}');
+    if (!end || end <= brace + 1) return strdup(text);
+
+    bool is_enum = contains_word_before(text, brace, "enum");
+    bool is_struct = contains_word_before(text, brace, "struct") ||
+                     contains_word_before(text, brace, "class") ||
+                     contains_word_before(text, brace, "union");
+    if (!is_enum && !is_struct) return strdup(text);
+
+    char *segment = strndup(brace + 1, (size_t)(end - brace - 1));
+    if (!segment) return strdup(text);
+
+    char *out = NULL;
+    int out_len = 0;
+    int out_cap = 0;
+    append_str(&out, &out_len, &out_cap, text);
+
+    int count = 0;
+    const int max_items = 12;
+    char *p = segment;
+    char *token_start = segment;
+    for (; ; p++) {
+        if (*p == '\0' || *p == '\n' || *p == ';' || *p == ',') {
+            char saved = *p;
+            *p = '\0';
+            char *token = token_start;
+            char *comment = strstr(token, "//");
+            if (comment) *comment = '\0';
+            while (*token && isspace((unsigned char)*token)) token++;
+            char *tail = token + strlen(token);
+            while (tail > token && isspace((unsigned char)tail[-1])) tail--;
+            *tail = '\0';
+            if (*token) {
+                char ident[64];
+                extract_last_identifier(token, ident, sizeof(ident));
+                if (ident[0] != '\0') {
+                    if (count == 0) {
+                        append_str(&out, &out_len, &out_cap, "\n\n");
+                        append_str(&out, &out_len, &out_cap, is_enum ? "Variants:" : "Fields:");
+                    }
+                    if (count < max_items) {
+                        append_str(&out, &out_len, &out_cap, "\n- ");
+                        append_str(&out, &out_len, &out_cap, ident);
+                    }
+                    count++;
+                }
+            }
+            if (saved == '\0') break;
+            *p = saved;
+            token_start = p + 1;
+        }
+    }
+
+    if (count > max_items) {
+        append_str(&out, &out_len, &out_cap, "\n- ...");
+    }
+
+    free(segment);
+    if (!out) return strdup(text);
+    return out;
+}
+
 void lsp_semantic_tokens_handler(const char *uri, SemanticToken *tokens, int count) {
     if (!uri) return;
 
@@ -791,6 +946,85 @@ void lsp_semantic_tokens_handler(const char *uri, SemanticToken *tokens, int cou
 void request_semantic_tokens(Tab *tab) {
     if (!editor.lsp_enabled || !tab || !tab->filename || !tab->lsp_opened) return;
     lsp_request_semantic_tokens(tab->filename);
+}
+
+static void clear_hover(void) {
+    if (editor.hover_text) {
+        free(editor.hover_text);
+        editor.hover_text = NULL;
+    }
+    if (editor.hover_active) {
+        editor.needs_full_redraw = true;
+    }
+    editor.hover_active = false;
+    editor.hover_request_active = false;
+}
+
+static void schedule_hover_request(int buffer_line, int buffer_col, int screen_x, int screen_y) {
+    if (buffer_line < 0 || buffer_col < 0) return;
+
+    if (editor.hover_target_line != buffer_line || editor.hover_target_col != buffer_col ||
+        editor.hover_screen_x != screen_x || editor.hover_screen_y != screen_y) {
+        clear_hover();
+    }
+
+    editor.hover_target_line = buffer_line;
+    editor.hover_target_col = buffer_col;
+    editor.hover_screen_x = screen_x;
+    editor.hover_screen_y = screen_y;
+    editor.hover_last_move_ms = monotonic_ms();
+    editor.hover_pending = true;
+}
+
+static void process_hover_request(void) {
+    if (!editor.hover_pending) return;
+    if (monotonic_ms() - editor.hover_last_move_ms < HOVER_DELAY_MS) return;
+
+    Tab *tab = get_current_tab();
+    if (editor.quit_confirmation_active || editor.reload_confirmation_active ||
+        editor.file_manager_focused || editor.mouse_dragging) {
+        editor.hover_pending = false;
+        return;
+    }
+
+    if (!tab || !editor.lsp_enabled || !tab->lsp_opened || !tab->filename) {
+        editor.hover_pending = false;
+        return;
+    }
+
+    editor.hover_pending = false;
+    editor.hover_request_line = editor.hover_target_line;
+    editor.hover_request_col = editor.hover_target_col;
+    editor.hover_request_ms = monotonic_ms();
+    editor.hover_request_active = true;
+    lsp_request_hover(tab->filename, editor.hover_request_line, editor.hover_request_col);
+}
+
+void lsp_hover_handler(const char *uri, int line, int col, const char *text) {
+    if (!uri) return;
+
+    char *path = lsp_uri_to_path(uri);
+    if (!path) return;
+
+    int tab_idx = find_tab_with_file(path);
+    free(path);
+
+    editor.hover_request_active = false;
+    if (tab_idx < 0) return;
+    if (tab_idx != editor.current_tab) return;
+    if (line != editor.hover_request_line || col != editor.hover_request_col) return;
+
+    clear_hover();
+
+    if (!text || text[0] == '\0') {
+        editor.needs_full_redraw = true;
+        return;
+    }
+
+    char *augmented = append_hover_members(text);
+    editor.hover_text = augmented ? augmented : strdup(text);
+    editor.hover_active = editor.hover_text != NULL;
+    editor.needs_full_redraw = true;
 }
 
 const char *get_token_color(SemanticTokenType type) {
@@ -918,6 +1152,13 @@ int main(int argc, char *argv[]) {
         
         process_resize();
         scroll_if_needed();
+        process_hover_request();
+        if (editor.hover_request_active &&
+            (monotonic_ms() - editor.hover_request_ms > 1000)) {
+            editor.hover_request_active = false;
+            clear_hover();
+            set_status_message("Hover: no response");
+        }
         
         // Check for external file changes (only if no dialog is active)
         if (!editor.quit_confirmation_active && !editor.reload_confirmation_active) {
@@ -955,6 +1196,10 @@ int main(int argc, char *argv[]) {
             // Input is available, read it
             c = terminal_read_key();
             pending_draw = true;
+            if (c != 0) {
+                clear_hover();
+                editor.hover_pending = false;
+            }
         } else {
             // No user input available, continue loop for resize checking
             if (frame_due(&last_frame, 16) && pending_draw) {
@@ -1195,6 +1440,34 @@ int main(int argc, char *argv[]) {
                 tab->selecting = true;
                 editor.needs_full_redraw = true;
                 set_status_message("Selected all text");
+            }
+            pending_draw = true;
+        } else if (c == CTRL_KEY('g')) {
+            Tab* tab = get_current_tab();
+            if (!tab || !tab->filename) {
+                set_status_message("Hover: no file");
+            } else if (!editor.lsp_enabled || !tab->lsp_opened) {
+                set_status_message("Hover: LSP not active");
+            } else if (!lsp_hover_is_supported()) {
+                set_status_message("Hover: not supported by LSP");
+            } else {
+                if (editor.hover_active) {
+                    clear_hover();
+                } else {
+                    int row = 0;
+                    int col = 0;
+                    get_cursor_screen_pos(tab, &row, &col);
+                    editor.hover_screen_x = col;
+                    editor.hover_screen_y = row;
+                    editor.hover_target_line = tab->cursor_y;
+                    editor.hover_target_col = tab->cursor_x;
+                    editor.hover_request_line = tab->cursor_y;
+                    editor.hover_request_col = tab->cursor_x;
+                    editor.hover_pending = false;
+                    editor.hover_request_ms = monotonic_ms();
+                    editor.hover_request_active = true;
+                    lsp_request_hover(tab->filename, tab->cursor_y, tab->cursor_x);
+                }
             }
             pending_draw = true;
         } else if (c == '\r' || c == '\n') {
@@ -1502,6 +1775,8 @@ void switch_to_tab(int tab_index) {
 
     editor.current_tab = tab_index;
     editor.needs_full_redraw = true;
+    clear_hover();
+    editor.hover_pending = false;
 
     // Ensure the file is opened in LSP
     Tab *tab = get_current_tab();
@@ -1525,6 +1800,7 @@ void cleanup_and_exit(int status) {
     if (editor.status_message) free(editor.status_message);
     if (editor.search_query) free(editor.search_query);
     if (editor.filename_input) free(editor.filename_input);
+    if (editor.hover_text) free(editor.hover_text);
     if (editor.current_directory) free(editor.current_directory);
     free_file_list();
     exit(status);
@@ -2202,6 +2478,55 @@ void handle_mouse(int button, int x, int y, int pressed) {
     Tab* tab = get_current_tab();
     if (!tab) return;
 
+    if (button == MOUSE_MOVE_EVENT) {
+        if (editor.mouse_dragging || tab->selecting) return;
+
+        if (y <= 1) {
+            clear_hover();
+            editor.hover_pending = false;
+            return;
+        }
+
+        int file_manager_end = 0;
+        if (editor.file_manager_visible && !editor.file_manager_overlay_mode) {
+            file_manager_end = editor.file_manager_width + 1; // +1 for border
+        }
+
+        if (editor.file_manager_visible && x <= file_manager_end) {
+            clear_hover();
+            editor.hover_pending = false;
+            return;
+        }
+
+        int editor_x_offset = file_manager_end;
+        if (x <= editor_x_offset + editor.line_number_width) {
+            clear_hover();
+            editor.hover_pending = false;
+            return;
+        }
+
+        int buffer_x = x - editor_x_offset - editor.line_number_width - 1 + tab->offset_x;
+        int screen_row = y - 2;  // -2 for tab bar
+        int buffer_y = screen_y_to_file_y(tab, screen_row);
+
+        if (buffer_y < 0 || buffer_y >= tab->buffer->line_count) {
+            clear_hover();
+            editor.hover_pending = false;
+            return;
+        }
+
+        int line_len = tab->buffer->lines[buffer_y] ?
+                       strlen(tab->buffer->lines[buffer_y]) : 0;
+        if (buffer_x > line_len) buffer_x = line_len;
+        if (buffer_x < 0) buffer_x = 0;
+
+        schedule_hover_request(buffer_y, buffer_x, x, y);
+        return;
+    }
+
+    clear_hover();
+    editor.hover_pending = false;
+
     // Handle clicks on tab bar
     if (y == 1 && button == 0 && pressed) {
         // Calculate tab bar start position
@@ -2337,6 +2662,8 @@ void handle_mouse(int button, int x, int y, int pressed) {
             
             // Clear any existing selection on click
             clear_selection();
+            clear_hover();
+            editor.hover_pending = false;
         } else {
             // Mouse button released - end drag operation
             if (editor.mouse_dragging) {

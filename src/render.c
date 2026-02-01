@@ -10,6 +10,7 @@
 #include <time.h>
 
 static void draw_modal(RenderBuf *rb, const char* title, const char* message, const char* bg_color, const char* fg_color);
+static void draw_hover_popup(RenderBuf *rb);
 
 void render_buf_init(RenderBuf *rb) {
     rb->data = NULL;
@@ -564,6 +565,94 @@ void draw_modal(RenderBuf *rb, const char* title, const char* message, const cha
     render_buf_append(rb, COLOR_RESET); // Reset formatting
 }
 
+static void draw_hover_popup(RenderBuf *rb) {
+    if (!editor.hover_active || !editor.hover_text) return;
+    if (editor.quit_confirmation_active || editor.reload_confirmation_active) return;
+
+    int max_width = editor.screen_cols - 4;
+    if (max_width < 20) return;
+
+    int wrap_width = max_width - 2;
+    if (wrap_width < 10) wrap_width = 10;
+
+    int max_line_len = 0;
+    int total_lines = 0;
+    const char *line = editor.hover_text;
+
+    while (line && *line) {
+        const char *next = strchr(line, '\n');
+        int line_len = next ? (int)(next - line) : (int)strlen(line);
+        if (line_len > max_line_len) {
+            max_line_len = line_len > wrap_width ? wrap_width : line_len;
+        }
+        int wrapped = line_len == 0 ? 1 : (line_len + wrap_width - 1) / wrap_width;
+        total_lines += wrapped;
+        if (!next) break;
+        line = next + 1;
+    }
+    if (total_lines == 0) total_lines = 1;
+
+    int content_width = max_line_len;
+    if (content_width < 20) content_width = 20;
+    if (content_width > wrap_width) content_width = wrap_width;
+
+    int popup_width = content_width + 2;
+    int popup_height = total_lines + 2;
+
+    int start_col = editor.hover_screen_x;
+    int start_row = editor.hover_screen_y + 1;
+
+    if (start_col + popup_width > editor.screen_cols) {
+        start_col = editor.screen_cols - popup_width + 1;
+    }
+    if (start_col < 1) start_col = 1;
+
+    int max_row = editor.screen_rows - 1;
+    if (start_row + popup_height > max_row) {
+        start_row = editor.hover_screen_y - popup_height - 1;
+    }
+    if (start_row < 2) start_row = 2;
+
+    for (int y = 0; y < popup_height; y++) {
+        render_move_cursor(rb, start_row + y, start_col);
+        render_buf_append(rb, STYLE_HOVER_BG);
+        for (int x = 0; x < popup_width; x++) {
+            render_buf_append(rb, " ");
+        }
+    }
+
+    int row = start_row + 1;
+    line = editor.hover_text;
+    while (line && *line && row < start_row + popup_height - 1) {
+        const char *next = strchr(line, '\n');
+        int line_len = next ? (int)(next - line) : (int)strlen(line);
+        if (line_len == 0) {
+            render_move_cursor(rb, row, start_col + 1);
+            render_buf_appendf(rb, "%s%s", COLOR_NORMAL, STYLE_HOVER_BG STYLE_HOVER_FG);
+            row++;
+            if (!next) break;
+            line = next + 1;
+            continue;
+        }
+
+        int offset = 0;
+        while (offset < line_len && row < start_row + popup_height - 1) {
+            int chunk = line_len - offset;
+            if (chunk > content_width) chunk = content_width;
+            render_move_cursor(rb, row, start_col + 1);
+            render_buf_appendf(rb, "%s%s", COLOR_NORMAL, STYLE_HOVER_BG STYLE_HOVER_FG);
+            render_buf_appendf(rb, "%.*s", chunk, line + offset);
+            offset += chunk;
+            row++;
+        }
+
+        if (!next) break;
+        line = next + 1;
+    }
+
+    render_buf_append(rb, COLOR_RESET);
+}
+
 void draw_screen(void) {
     Tab* tab = get_current_tab();
     if (!tab) return;
@@ -617,6 +706,8 @@ void draw_screen(void) {
         }
         draw_status_line(&rb);
     }
+
+    draw_hover_popup(&rb);
     
     // Draw confirmation dialogs if active (overlay on top of everything)
     draw_quit_confirmation(&rb);

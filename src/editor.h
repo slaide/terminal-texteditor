@@ -121,6 +121,17 @@ typedef struct {
 
     // LSP state
     bool lsp_enabled;
+
+    // Hover popup state
+    bool hover_active;
+    bool hover_pending;
+    char *hover_text;
+    int hover_screen_x, hover_screen_y;
+    int hover_target_line, hover_target_col;
+    int hover_request_line, hover_request_col;
+    long long hover_last_move_ms;
+    long long hover_request_ms;
+    bool hover_request_active;
 } Editor;
 
 extern Editor editor;
