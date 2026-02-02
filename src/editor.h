@@ -40,6 +40,12 @@ typedef struct {
 } FileEntry;
 
 typedef struct {
+    char *label;
+    char *detail;
+    char *doc;
+} CompletionEntry;
+
+typedef struct {
     TextBuffer *buffer;
     int cursor_x, cursor_y;
     int offset_x, offset_y;
@@ -140,6 +146,20 @@ typedef struct {
     int word_anchor_line;
     int word_anchor_start;
     int word_anchor_end;
+
+    // Completion popup state
+    bool completion_active;
+    bool completion_request_active;
+    int completion_request_line;
+    int completion_request_col;
+    long long completion_request_ms;
+    int completion_screen_x;
+    int completion_screen_y;
+    CompletionEntry *completion_items;
+    int completion_count;
+    int completion_capacity;
+    char *completion_prefix;
+    bool completion_prefix_match;
 } Editor;
 
 extern Editor editor;

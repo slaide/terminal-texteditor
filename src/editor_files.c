@@ -2,11 +2,13 @@
 #include "editor_files.h"
 #include "buffer.h"
 #include "editor.h"
+#include "editor_completion.h"
 #include "editor_tabs.h"
 #include "editor_selection.h"
 #include "lsp_integration.h"
 #include "render.h"
 #include "terminal.h"
+#include <ctype.h>
 #include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -133,6 +135,19 @@ void insert_char(char c) {
     // Notify LSP of the change
     notify_lsp_file_changed(tab);
 
+    if (c == '.') {
+        completion_request_at_cursor(tab, ".", 2, false);
+    } else if (isalnum((unsigned char)c) || c == '_') {
+        if (editor.completion_active || editor.completion_request_active ||
+            completion_has_member_context(tab)) {
+            completion_request_at_cursor(tab, NULL, 3, true);
+        } else if (editor.completion_active) {
+            completion_clear();
+        }
+    } else if (editor.completion_active) {
+        completion_clear();
+    }
+
     // Calculate text start column for consistent drawing
     int text_start_col = 1;
     if (editor.file_manager_visible && !editor.file_manager_overlay_mode) {
@@ -153,6 +168,13 @@ void delete_char(void) {
         // Notify LSP of the change
         notify_lsp_file_changed(tab);
 
+        if (editor.completion_active || editor.completion_request_active ||
+            completion_has_member_context(tab)) {
+            completion_request_at_cursor(tab, NULL, 3, true);
+        } else if (editor.completion_active) {
+            completion_clear();
+        }
+
         // Calculate text start column for consistent drawing
         int text_start_col = 1;
         if (editor.file_manager_visible && !editor.file_manager_overlay_mode) {
@@ -169,6 +191,13 @@ void delete_char(void) {
 
         // Notify LSP of the change
         notify_lsp_file_changed(tab);
+
+        if (editor.completion_active || editor.completion_request_active ||
+            completion_has_member_context(tab)) {
+            completion_request_at_cursor(tab, NULL, 3, true);
+        } else if (editor.completion_active) {
+            completion_clear();
+        }
 
         editor.needs_full_redraw = true;
     }

@@ -10,6 +10,7 @@
 #include <time.h>
 
 static void draw_modal(RenderBuf *rb, const char* title, const char* message, const char* bg_color, const char* fg_color);
+static void draw_completion_popup(RenderBuf *rb);
 static void draw_hover_popup(RenderBuf *rb);
 
 void render_buf_init(RenderBuf *rb) {
@@ -565,6 +566,129 @@ void draw_modal(RenderBuf *rb, const char* title, const char* message, const cha
     render_buf_append(rb, COLOR_RESET); // Reset formatting
 }
 
+static int completion_line_len(const CompletionEntry *item) {
+    if (!item || !item->label) return 0;
+    int len = (int)strlen(item->label);
+    if (item->detail && item->detail[0] != '\0') {
+        len += 3 + (int)strlen(item->detail); // " : "
+    }
+    if (item->doc && item->doc[0] != '\0') {
+        len += 3 + (int)strlen(item->doc); // " - "
+    }
+    return len;
+}
+
+static void render_completion_line(RenderBuf *rb, const CompletionEntry *item, int width) {
+    if (!item || !item->label || width <= 0) return;
+    int remaining = width;
+
+    int label_len = (int)strlen(item->label);
+    int take = label_len < remaining ? label_len : remaining;
+    render_buf_appendf(rb, "%.*s", take, item->label);
+    remaining -= take;
+    if (remaining <= 0) return;
+
+    if (item->detail && item->detail[0] != '\0' && remaining > 0) {
+        const char *sep = " : ";
+        int sep_len = 3;
+        if (sep_len > remaining) return;
+        render_buf_append(rb, sep);
+        remaining -= sep_len;
+        if (remaining <= 0) return;
+        int detail_len = (int)strlen(item->detail);
+        take = detail_len < remaining ? detail_len : remaining;
+        render_buf_appendf(rb, "%.*s", take, item->detail);
+        remaining -= take;
+    }
+
+    if (item->doc && item->doc[0] != '\0' && remaining > 0) {
+        const char *sep = " - ";
+        int sep_len = 3;
+        if (sep_len > remaining) return;
+        render_buf_append(rb, sep);
+        remaining -= sep_len;
+        if (remaining <= 0) return;
+        int doc_len = (int)strlen(item->doc);
+        take = doc_len < remaining ? doc_len : remaining;
+        render_buf_appendf(rb, "%.*s", take, item->doc);
+    }
+}
+
+static void draw_completion_popup(RenderBuf *rb) {
+    if (!editor.completion_active || editor.completion_count <= 0) return;
+    if (editor.quit_confirmation_active || editor.reload_confirmation_active) return;
+
+    int max_width = editor.screen_cols - 4;
+    if (max_width < 20) return;
+
+    int max_line_len = 0;
+    for (int i = 0; i < editor.completion_count; i++) {
+        int line_len = completion_line_len(&editor.completion_items[i]);
+        if (line_len > max_line_len) max_line_len = line_len;
+    }
+
+    int content_width = max_line_len;
+    if (content_width < 20) content_width = 20;
+    if (content_width > max_width - 2) content_width = max_width - 2;
+
+    int max_height = editor.screen_rows - 3;
+    if (max_height < 3) return;
+
+    bool show_no_match = editor.completion_prefix &&
+                         editor.completion_prefix[0] != '\0' &&
+                         !editor.completion_prefix_match;
+    int total_lines = editor.completion_count + (show_no_match ? 1 : 0);
+    int visible_lines = total_lines;
+    if (visible_lines > max_height - 2) visible_lines = max_height - 2;
+    if (visible_lines < 1) visible_lines = 1;
+
+    int popup_width = content_width + 2;
+    int popup_height = visible_lines + 2;
+
+    int start_col = editor.completion_screen_x;
+    int start_row = editor.completion_screen_y + 1;
+
+    if (start_col + popup_width > editor.screen_cols) {
+        start_col = editor.screen_cols - popup_width + 1;
+    }
+    if (start_col < 1) start_col = 1;
+
+    int max_row = editor.screen_rows - 1;
+    if (start_row + popup_height > max_row) {
+        start_row = editor.completion_screen_y - popup_height - 1;
+    }
+    if (start_row < 2) start_row = 2;
+
+    for (int y = 0; y < popup_height; y++) {
+        render_move_cursor(rb, start_row + y, start_col);
+        render_buf_append(rb, STYLE_HOVER_BG);
+        for (int x = 0; x < popup_width; x++) {
+            render_buf_append(rb, " ");
+        }
+    }
+
+    int row = start_row + 1;
+    int remaining = visible_lines;
+    int idx = 0;
+    if (show_no_match && remaining > 0) {
+        render_move_cursor(rb, row, start_col + 1);
+        render_buf_appendf(rb, "%s%s", COLOR_NORMAL, STYLE_HOVER_BG FG_RED);
+        render_buf_appendf(rb, "%.*s", content_width, editor.completion_prefix);
+        row++;
+        remaining--;
+    }
+    while (remaining > 0 && idx < editor.completion_count) {
+        render_move_cursor(rb, row, start_col + 1);
+        render_buf_appendf(rb, "%s%s", COLOR_NORMAL, STYLE_HOVER_BG STYLE_HOVER_FG);
+        render_completion_line(rb, &editor.completion_items[idx], content_width);
+        row++;
+        idx++;
+        remaining--;
+    }
+
+    render_buf_append(rb, COLOR_RESET);
+}
+
 static void draw_hover_popup(RenderBuf *rb) {
     if (!editor.hover_active || !editor.hover_text) return;
     if (editor.quit_confirmation_active || editor.reload_confirmation_active) return;
@@ -707,6 +831,7 @@ void draw_screen(void) {
         draw_status_line(&rb);
     }
 
+    draw_completion_popup(&rb);
     draw_hover_popup(&rb);
     
     // Draw confirmation dialogs if active (overlay on top of everything)

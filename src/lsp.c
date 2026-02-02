@@ -14,7 +14,8 @@
 // Pending request tracking
 typedef enum {
     REQ_SEMANTIC_TOKENS,
-    REQ_HOVER
+    REQ_HOVER,
+    REQ_COMPLETION
 } PendingRequestType;
 
 typedef struct {
@@ -37,7 +38,9 @@ static struct {
     lsp_diagnostics_callback diagnostics_cb;
     lsp_semantic_tokens_callback semantic_cb;
     lsp_hover_callback hover_cb;
+    lsp_completion_callback completion_cb;
     bool hover_supported;
+    bool completion_supported;
 
     // Read buffer for incoming messages
     char *read_buf;
@@ -57,6 +60,8 @@ static struct {
 // Forward declarations
 static bool send_message(JsonValue *msg);
 static void handle_message(JsonValue *msg);
+static char *completion_doc_to_text(JsonValue *doc);
+static void free_completion_items(LspCompletionItem *items, int count);
 
 // Add a pending request
 static void add_pending_request(int id, const char *uri, PendingRequestType type, int line, int col) {
@@ -265,6 +270,31 @@ static void append_text(char **buf, int *len, int *cap, const char *text) {
     memcpy(*buf + *len, text, add_len);
     *len += add_len;
     (*buf)[*len] = '\0';
+}
+
+static char *completion_doc_to_text(JsonValue *doc) {
+    if (!doc) return NULL;
+    if (doc->type == JSON_STRING) {
+        const char *s = json_get_string(doc);
+        return s ? strdup(s) : NULL;
+    }
+    if (doc->type == JSON_OBJECT) {
+        JsonValue *value = json_object_get(doc, "value");
+        if (value && value->type == JSON_STRING) {
+            const char *s = json_get_string(value);
+            return s ? strdup(s) : NULL;
+        }
+    }
+    return NULL;
+}
+
+static void free_completion_items(LspCompletionItem *items, int count) {
+    if (!items) return;
+    for (int i = 0; i < count; i++) {
+        free(items[i].label);
+        free(items[i].detail);
+        free(items[i].documentation);
+    }
 }
 
 static void append_segment(char **buf, int *len, int *cap, const char *text) {
@@ -493,6 +523,14 @@ static void handle_message(JsonValue *msg) {
                         lsp.hover_supported = true;
                     }
                 }
+                JsonValue *completionProvider = json_object_get(caps, "completionProvider");
+                if (completionProvider) {
+                    if (completionProvider->type == JSON_BOOL) {
+                        lsp.completion_supported = json_get_bool(completionProvider);
+                    } else if (completionProvider->type == JSON_OBJECT) {
+                        lsp.completion_supported = true;
+                    }
+                }
                 JsonValue *semTokens = json_object_get(caps, "semanticTokensProvider");
                 if (semTokens) {
                     JsonValue *legend = json_object_get(semTokens, "legend");
@@ -525,6 +563,70 @@ static void handle_message(JsonValue *msg) {
                     lsp.hover_cb(req.uri, req.line, req.col, buf);
                 } else {
                     handle_hover_response(&req, result);
+                }
+            } else if (req.type == REQ_COMPLETION) {
+                if (!lsp.completion_cb) {
+                    // Nothing to do
+                } else if (!result && error_msg) {
+                    lsp.completion_cb(req.uri, req.line, req.col, NULL, 0);
+                } else if (result) {
+                    JsonValue *items = NULL;
+                    bool is_incomplete = false;
+                    if (result->type == JSON_ARRAY) {
+                        items = result;
+                    } else if (result->type == JSON_OBJECT) {
+                        JsonValue *list_items = json_object_get(result, "items");
+                        if (list_items && list_items->type == JSON_ARRAY) {
+                            items = list_items;
+                        }
+                        JsonValue *incomplete = json_object_get(result, "isIncomplete");
+                        if (incomplete && incomplete->type == JSON_BOOL) {
+                            is_incomplete = json_get_bool(incomplete);
+                        }
+                    }
+
+                    if (!items) {
+                        lsp.completion_cb(req.uri, req.line, req.col, NULL, 0);
+                    } else {
+                        int count = json_array_length(items);
+                        LspCompletionItem *out = NULL;
+                        if (count > 0) {
+                            out = calloc(count, sizeof(LspCompletionItem));
+                            if (!out) {
+                                lsp.completion_cb(req.uri, req.line, req.col, NULL, 0);
+                                if (req.uri) free(req.uri);
+                                return;
+                            }
+                        }
+                        int out_count = 0;
+                        for (int i = 0; i < count; i++) {
+                            JsonValue *item = json_array_get(items, i);
+                            if (!item || item->type != JSON_OBJECT) continue;
+
+                            JsonValue *label = json_object_get(item, "label");
+                            const char *label_str = label ? json_get_string(label) : NULL;
+                            if (!label_str || label_str[0] == '\0') continue;
+
+                            JsonValue *detail = json_object_get(item, "detail");
+                            const char *detail_str = detail ? json_get_string(detail) : NULL;
+
+                            JsonValue *documentation = json_object_get(item, "documentation");
+                            char *doc_text = completion_doc_to_text(documentation);
+
+                            out[out_count].label = strdup(label_str);
+                            out[out_count].detail = detail_str ? strdup(detail_str) : NULL;
+                            out[out_count].documentation = doc_text;
+                            out_count++;
+                        }
+
+                        if (is_incomplete) {
+                            // We don't implement resolution; still return what we have.
+                        }
+
+                        lsp.completion_cb(req.uri, req.line, req.col, out, out_count);
+                        free_completion_items(out, out_count);
+                        free(out);
+                    }
                 }
             }
             if (req.uri) free(req.uri);
@@ -729,6 +831,17 @@ bool lsp_init(const char *command) {
     json_array_push(hoverFormats, json_string("markdown"));
     json_object_set(hoverCaps, "contentFormat", hoverFormats);
     json_object_set(textDocCaps, "hover", hoverCaps);
+
+    JsonValue *completionCaps = json_object();
+    json_object_set(completionCaps, "dynamicRegistration", json_bool(false));
+    JsonValue *completionItem = json_object();
+    JsonValue *completionFormats = json_array();
+    json_array_push(completionFormats, json_string("plaintext"));
+    json_array_push(completionFormats, json_string("markdown"));
+    json_object_set(completionItem, "documentationFormat", completionFormats);
+    json_object_set(completionCaps, "completionItem", completionItem);
+    json_object_set(completionCaps, "contextSupport", json_bool(true));
+    json_object_set(textDocCaps, "completion", completionCaps);
 
     // Semantic tokens capability
     JsonValue *semTokenCaps = json_object();
@@ -972,6 +1085,10 @@ void lsp_set_hover_callback(lsp_hover_callback cb) {
     lsp.hover_cb = cb;
 }
 
+void lsp_set_completion_callback(lsp_completion_callback cb) {
+    lsp.completion_cb = cb;
+}
+
 void lsp_request_semantic_tokens(const char *path) {
     if (!lsp.running || !path) return;
 
@@ -1019,6 +1136,43 @@ void lsp_request_hover(const char *path, int line, int col) {
     free(uri);
 }
 
+void lsp_request_completion(const char *path, int line, int col, const char *trigger, int trigger_kind) {
+    if (!lsp.running || !path) return;
+
+    char *uri = lsp_path_to_uri(path);
+    if (!uri) return;
+
+    JsonValue *params = json_object();
+    JsonValue *textDoc = json_object();
+    JsonValue *pos = json_object();
+
+    json_object_set(textDoc, "uri", json_string(uri));
+    json_object_set(pos, "line", json_number(line));
+    json_object_set(pos, "character", json_number(col));
+    json_object_set(params, "textDocument", textDoc);
+    json_object_set(params, "position", pos);
+
+    JsonValue *context = json_object();
+    if (trigger_kind <= 0) trigger_kind = 1;
+    if (trigger && trigger[0] != '\0') {
+        json_object_set(context, "triggerKind", json_number(trigger_kind));
+        json_object_set(context, "triggerCharacter", json_string(trigger));
+    } else {
+        json_object_set(context, "triggerKind", json_number(trigger_kind));
+    }
+    json_object_set(params, "context", context);
+
+    JsonValue *req = create_request("textDocument/completion", params);
+    add_pending_request(lsp.request_id, uri, REQ_COMPLETION, line, col);
+    send_message(req);
+    json_free(req);
+    free(uri);
+}
+
 bool lsp_hover_is_supported(void) {
     return lsp.hover_supported;
+}
+
+bool lsp_completion_is_supported(void) {
+    return lsp.completion_supported;
 }

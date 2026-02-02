@@ -5,6 +5,7 @@
 #include "editor_folds.h"
 #include "editor_selection.h"
 #include "editor_cursor.h"
+#include "editor_completion.h"
 #include "editor_hover.h"
 #include "terminal.h"
 #include <stdlib.h>
@@ -82,6 +83,8 @@ static void get_word_bounds_at(Tab *tab, int line, int col, int *out_start, int 
 void handle_mouse(int button, int x, int y, int pressed) {
     Tab* tab = get_current_tab();
     if (!tab) return;
+
+    completion_clear();
 
     if (button == MOUSE_MOVE_EVENT) {
         if (editor.mouse_dragging || tab->selecting) return;

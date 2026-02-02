@@ -2,6 +2,7 @@
 #include "editor_app.h"
 #include "clipboard.h"
 #include "editor.h"
+#include "editor_completion.h"
 #include "editor_cursor.h"
 #include "editor_files.h"
 #include "editor_hover.h"
@@ -64,6 +65,7 @@ void cleanup_and_exit(int status) {
     if (editor.search_query) free(editor.search_query);
     if (editor.filename_input) free(editor.filename_input);
     if (editor.hover_text) free(editor.hover_text);
+    completion_clear();
     if (editor.current_directory) free(editor.current_directory);
     free_file_list();
     exit(status);
@@ -177,6 +179,12 @@ int editor_run(int argc, char *argv[]) {
             editor.hover_request_active = false;
             hover_clear();
             set_status_message("Hover: no response");
+        }
+        if (editor.completion_request_active &&
+            (monotonic_ms() - editor.completion_request_ms > 1000)) {
+            editor.completion_request_active = false;
+            completion_clear();
+            set_status_message("Completion: no response");
         }
         
         if (!editor.quit_confirmation_active && !editor.reload_confirmation_active) {

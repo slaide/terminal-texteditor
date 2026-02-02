@@ -2,6 +2,7 @@
 #include "lsp_integration.h"
 #include "editor_config.h"
 #include "terminal.h"
+#include "editor_completion.h"
 #include "editor_tabs.h"
 #include <stdlib.h>
 #include <string.h>
@@ -177,6 +178,7 @@ void notify_lsp_file_opened(Tab *tab) {
         lsp_set_diagnostics_callback(lsp_diagnostics_handler);
         lsp_set_semantic_tokens_callback(lsp_semantic_tokens_handler);
         lsp_set_hover_callback(lsp_hover_handler);
+        lsp_set_completion_callback(lsp_completion_handler);
     } else {
         return;
     }
