@@ -121,8 +121,11 @@ void handle_mouse(int button, int x, int y, int pressed) {
 
         int line_len = tab->buffer->lines[buffer_y] ?
                        strlen(tab->buffer->lines[buffer_y]) : 0;
-        if (buffer_x > line_len) buffer_x = line_len;
         if (buffer_x < 0) buffer_x = 0;
+        if (buffer_x >= line_len) {
+            hover_clear();
+            return;
+        }
 
         hover_schedule_request(buffer_y, buffer_x, x, y);
         return;
