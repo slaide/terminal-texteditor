@@ -144,14 +144,16 @@ static void draw_line_to_buf(RenderBuf *rb, int screen_y, int file_y, int start_
                     sel_end_y = tmp;
                 }
                 // Check if selection overlaps with fold region
-                if (sel_start_y <= fold->end_line && sel_end_y >= file_y) {
+                int fold_hidden_end = fold->end_line - 1;
+                if (fold_hidden_end >= file_y + 1 &&
+                    sel_start_y <= fold_hidden_end && sel_end_y >= file_y + 1) {
                     fold_has_selection = true;
                 }
             }
 
             // Show abbreviated content with fold indicator
             char *line = tab->buffer->lines[file_y];
-            int folded_lines = fold->end_line - fold->start_line;
+            int folded_lines = fold->end_line - fold->start_line - 1;
             int display_len = available_cols - editor.line_number_width - 20;
             if (display_len < 10) display_len = 10;
 

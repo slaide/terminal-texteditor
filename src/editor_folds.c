@@ -194,7 +194,7 @@ Fold *get_fold_at_line(Tab *tab, int line) {
 Fold *get_fold_containing_line(Tab *tab, int line) {
     if (!tab) return NULL;
     for (int i = 0; i < tab->fold_count; i++) {
-        if (line > tab->folds[i].start_line && line <= tab->folds[i].end_line) {
+        if (line > tab->folds[i].start_line && line < tab->folds[i].end_line) {
             return &tab->folds[i];
         }
     }
@@ -235,7 +235,7 @@ int count_folded_lines_before(Tab *tab, int line) {
     for (int i = 0; i < tab->fold_count; i++) {
         if (tab->folds[i].is_folded && tab->folds[i].start_line < line) {
             if (tab->folds[i].end_line < line) {
-                count += tab->folds[i].end_line - tab->folds[i].start_line;
+                count += tab->folds[i].end_line - tab->folds[i].start_line - 1;
             } else {
                 count += line - tab->folds[i].start_line - 1;
             }
