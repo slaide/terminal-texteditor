@@ -4,6 +4,7 @@
 #include "editor.h"
 #include "editor_completion.h"
 #include "editor_tabs.h"
+#include "editor_folds.h"
 #include "editor_selection.h"
 #include "lsp_integration.h"
 #include "render.h"
@@ -117,6 +118,7 @@ void save_file(void) {
         tab->file_mtime = get_file_mtime(tab->filename);
         set_status_message("File saved: %s", tab->filename);
 
+        detect_folds(tab);
         // Request updated semantic tokens for syntax highlighting
         request_semantic_tokens(tab);
     } else {
@@ -134,6 +136,7 @@ void insert_char(char c) {
 
     // Notify LSP of the change
     notify_lsp_file_changed(tab);
+    detect_folds(tab);
 
     if (c == '.') {
         completion_request_at_cursor(tab, ".", 2, false);
@@ -167,6 +170,7 @@ void delete_char(void) {
 
         // Notify LSP of the change
         notify_lsp_file_changed(tab);
+        detect_folds(tab);
 
         if (editor.completion_active || editor.completion_request_active ||
             completion_has_member_context(tab)) {
@@ -191,6 +195,7 @@ void delete_char(void) {
 
         // Notify LSP of the change
         notify_lsp_file_changed(tab);
+        detect_folds(tab);
 
         if (editor.completion_active || editor.completion_request_active ||
             completion_has_member_context(tab)) {
@@ -214,6 +219,7 @@ void insert_newline(void) {
 
     // Notify LSP of the change
     notify_lsp_file_changed(tab);
+    detect_folds(tab);
 
     editor.needs_full_redraw = true;
 }

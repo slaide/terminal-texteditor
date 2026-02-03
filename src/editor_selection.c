@@ -3,6 +3,7 @@
 #include "editor.h"
 #include "editor_tabs.h"
 #include "buffer.h"
+#include "editor_folds.h"
 #include "lsp_integration.h"
 #include <stdlib.h>
 #include <string.h>
@@ -103,6 +104,7 @@ void delete_selection(void) {
     tab->modified = true;
 
     notify_lsp_file_changed(tab);
+    detect_folds(tab);
 
     editor.needs_full_redraw = true;
 }
