@@ -243,6 +243,38 @@ void hover_schedule_request(int buffer_line, int buffer_col, int screen_x, int s
     editor.hover_pending = true;
 }
 
+void hover_show_diagnostic(int buffer_line, int screen_x, int screen_y) {
+    if (buffer_line < 0) return;
+
+    const char *msg = get_line_diagnostic_message(get_current_tab(), buffer_line);
+    if (!msg || msg[0] == '\0') {
+        hover_clear();
+        return;
+    }
+
+    const char *sev_str = "Info";
+    DiagnosticSeverity sev = get_line_diagnostic_severity(get_current_tab(), buffer_line);
+    if (sev == DIAG_ERROR) sev_str = "Error";
+    else if (sev == DIAG_WARNING) sev_str = "Warning";
+    else if (sev == DIAG_HINT) sev_str = "Hint";
+
+    hover_clear();
+    editor.hover_screen_x = screen_x;
+    editor.hover_screen_y = screen_y;
+    editor.hover_target_line = buffer_line;
+    editor.hover_target_col = 0;
+    editor.hover_pending = false;
+    editor.hover_request_active = false;
+
+    size_t total_len = strlen(sev_str) + 2 + strlen(msg) + 1;
+    editor.hover_text = malloc(total_len);
+    if (editor.hover_text) {
+        snprintf(editor.hover_text, total_len, "%s: %s", sev_str, msg);
+        editor.hover_active = true;
+        editor.needs_full_redraw = true;
+    }
+}
+
 void hover_process_requests(void) {
     if (!editor.hover_pending) return;
     if (monotonic_ms() - editor.hover_last_move_ms < HOVER_DELAY_MS) return;

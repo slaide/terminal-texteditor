@@ -106,7 +106,13 @@ void handle_mouse(int button, int x, int y, int pressed) {
 
         int editor_x_offset = file_manager_end;
         if (x <= editor_x_offset + editor.line_number_width) {
-            hover_clear();
+            int screen_row = y - 2;
+            int buffer_y = screen_y_to_file_y(tab, screen_row);
+            if (buffer_y < 0 || buffer_y >= tab->buffer->line_count) {
+                hover_clear();
+                return;
+            }
+            hover_show_diagnostic(buffer_y, x, y);
             return;
         }
 
@@ -123,7 +129,7 @@ void handle_mouse(int button, int x, int y, int pressed) {
                        strlen(tab->buffer->lines[buffer_y]) : 0;
         if (buffer_x < 0) buffer_x = 0;
         if (buffer_x >= line_len) {
-            hover_clear();
+            hover_show_diagnostic(buffer_y, x, y);
             return;
         }
 
