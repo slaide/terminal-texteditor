@@ -185,6 +185,7 @@ static void draw_line_to_buf(RenderBuf *rb, int screen_y, int file_y, int start_
             // Calculate selection bounds for this line
             bool line_has_selection = false;
             int sel_start = 0, sel_end = 0;
+            int sel_end_y_norm = -1;
 
             if (tab->selecting) {
                 int sel_start_x = tab->select_start_x;
@@ -203,6 +204,10 @@ static void draw_line_to_buf(RenderBuf *rb, int screen_y, int file_y, int start_
                     line_has_selection = true;
                     sel_start = (file_y == sel_start_y) ? sel_start_x : 0;
                     sel_end = (file_y == sel_end_y) ? sel_end_x : len;
+                    sel_end_y_norm = sel_end_y;
+                    if (sel_start_y != sel_end_y && file_y == sel_end_y && sel_end_x == 0) {
+                        line_has_selection = false;
+                    }
                 }
             }
 
@@ -260,7 +265,7 @@ static void draw_line_to_buf(RenderBuf *rb, int screen_y, int file_y, int start_
             render_buf_append(rb, COLOR_RESET);
 
             // Show selection extends to end of line
-            if (line_has_selection && sel_end >= len && end_x >= len) {
+            if (line_has_selection && sel_end >= len && end_x >= len && sel_end_y_norm > file_y) {
                 render_buf_append(rb, "\033[7m \033[0m");
             }
         }
@@ -857,9 +862,7 @@ void draw_screen(void) {
     } else if (editor.file_manager_visible && editor.file_manager_focused) {
         // Hide cursor when file manager is focused
         terminal_hide_cursor();
-    } else if (!tab->selecting) {
-        terminal_show_cursor();
-
+    } else {
         // Calculate text area starting column (same logic as in draw_screen)
         int text_start_col = 1;
         if (editor.file_manager_visible && !editor.file_manager_overlay_mode) {
@@ -883,8 +886,11 @@ void draw_screen(void) {
         if (screen_col < text_start_col + 7) screen_col = text_start_col + 7;
 
         terminal_set_cursor_position(screen_row, screen_col);
-    } else {
-        terminal_hide_cursor();
+        if (editor.cursor_blink_on) {
+            terminal_show_cursor();
+        } else {
+            terminal_hide_cursor();
+        }
     }
     
     tab->last_cursor_x = tab->cursor_x;

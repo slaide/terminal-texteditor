@@ -160,6 +160,9 @@ typedef struct {
     int completion_capacity;
     char *completion_prefix;
     bool completion_prefix_match;
+
+    bool cursor_blink_on;
+    long long cursor_blink_last_ms;
 } Editor;
 
 extern Editor editor;

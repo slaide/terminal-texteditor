@@ -27,6 +27,8 @@
 
 Editor editor = {0};
 
+#define CURSOR_BLINK_MS 500
+
 static long frame_remaining_ms(struct timespec *last_frame, int target_ms) {
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
@@ -147,6 +149,8 @@ int editor_run(int argc, char *argv[]) {
     
     editor.line_number_width = 8;
     editor.needs_full_redraw = true;
+    editor.cursor_blink_on = true;
+    editor.cursor_blink_last_ms = monotonic_ms();
     
     Tab* tab = get_current_tab();
     if (tab && tab->filename) {
@@ -214,6 +218,9 @@ int editor_run(int argc, char *argv[]) {
             pending_draw = true;
         }
 
+        Tab *cursor_tab_before = get_current_tab();
+        int cursor_x_before = cursor_tab_before ? cursor_tab_before->cursor_x : 0;
+        int cursor_y_before = cursor_tab_before ? cursor_tab_before->cursor_y : 0;
         int c = 0;
         if (activity > 0 && FD_ISSET(STDIN_FILENO, &readfds)) {
             c = terminal_read_key();
@@ -222,6 +229,12 @@ int editor_run(int argc, char *argv[]) {
                 hover_clear();
             }
         } else {
+            long long now = monotonic_ms();
+            if (now - editor.cursor_blink_last_ms >= CURSOR_BLINK_MS) {
+                editor.cursor_blink_on = !editor.cursor_blink_on;
+                editor.cursor_blink_last_ms = now;
+                pending_draw = true;
+            }
             if (frame_due(&last_frame, 16) && pending_draw) {
                 draw_screen();
                 pending_draw = false;
@@ -641,6 +654,21 @@ int editor_run(int argc, char *argv[]) {
                 delete_selection();
             }
             insert_char(c);
+        }
+
+        Tab *cursor_tab_after = get_current_tab();
+        bool cursor_moved = false;
+        if (cursor_tab_after) {
+            if (cursor_tab_before != cursor_tab_after) {
+                cursor_moved = true;
+            } else if (cursor_tab_after->cursor_x != cursor_x_before ||
+                       cursor_tab_after->cursor_y != cursor_y_before) {
+                cursor_moved = true;
+            }
+        }
+        if (cursor_moved) {
+            editor.cursor_blink_on = !cursor_tab_after->selecting;
+            editor.cursor_blink_last_ms = monotonic_ms();
         }
 
         if (frame_due(&last_frame, 16) && pending_draw) {

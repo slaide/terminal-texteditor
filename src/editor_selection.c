@@ -54,6 +54,16 @@ void delete_selection(void) {
         start_x = end_x; start_y = end_y;
         end_x = temp_x; end_y = temp_y;
     }
+
+    if (start_y != end_y && end_x == 0) {
+        end_y--;
+        if (end_y < start_y) {
+            end_y = start_y;
+            end_x = start_x;
+        } else {
+            end_x = tab->buffer->lines[end_y] ? strlen(tab->buffer->lines[end_y]) : 0;
+        }
+    }
     
     if (start_y == end_y) {
         for (int x = end_x - 1; x >= start_x; x--) {
