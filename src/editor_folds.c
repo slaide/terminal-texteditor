@@ -202,8 +202,14 @@ Fold *get_fold_containing_line(Tab *tab, int line) {
 }
 
 bool is_line_visible(Tab *tab, int line) {
-    Fold *fold = get_fold_containing_line(tab, line);
-    return !(fold && fold->is_folded);
+    if (!tab) return true;
+    for (int i = 0; i < tab->fold_count; i++) {
+        if (!tab->folds[i].is_folded) continue;
+        if (line > tab->folds[i].start_line && line < tab->folds[i].end_line) {
+            return false;
+        }
+    }
+    return true;
 }
 
 int get_next_visible_line(Tab *tab, int line) {

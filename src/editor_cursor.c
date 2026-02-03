@@ -11,9 +11,12 @@ void move_cursor(int dx, int dy) {
 
     if (dy == 0 && dx < 0 && tab->cursor_x == 0) {
         if (tab->cursor_y > 0) {
-            tab->cursor_y--;
-            char *line = tab->buffer->lines[tab->cursor_y];
-            tab->cursor_x = line ? strlen(line) : 0;
+            int prev_line = get_prev_visible_line(tab, tab->cursor_y);
+            if (prev_line != tab->cursor_y) {
+                tab->cursor_y = prev_line;
+                char *line = tab->buffer->lines[tab->cursor_y];
+                tab->cursor_x = line ? strlen(line) : 0;
+            }
             editor.needs_full_redraw = true;
         }
         return;
@@ -24,8 +27,11 @@ void move_cursor(int dx, int dy) {
         int line_len = line ? strlen(line) : 0;
         if (tab->cursor_x >= line_len) {
             if (tab->cursor_y < tab->buffer->line_count - 1) {
-                tab->cursor_y++;
-                tab->cursor_x = 0;
+                int next_line = get_next_visible_line(tab, tab->cursor_y);
+                if (next_line != tab->cursor_y) {
+                    tab->cursor_y = next_line;
+                    tab->cursor_x = 0;
+                }
                 editor.needs_full_redraw = true;
             }
             return;
@@ -33,11 +39,25 @@ void move_cursor(int dx, int dy) {
     }
 
     tab->cursor_x += dx;
-    tab->cursor_y += dy;
+    if (dy != 0) {
+        if (dy > 0) {
+            tab->cursor_y = get_next_visible_line(tab, tab->cursor_y);
+        } else {
+            tab->cursor_y = get_prev_visible_line(tab, tab->cursor_y);
+        }
+    } else {
+        tab->cursor_y += dy;
+    }
     
     if (tab->cursor_y < 0) tab->cursor_y = 0;
     if (tab->cursor_y >= tab->buffer->line_count) {
         tab->cursor_y = tab->buffer->line_count - 1;
+    }
+    if (!is_line_visible(tab, tab->cursor_y)) {
+        int next_line = get_next_visible_line(tab, tab->cursor_y);
+        if (next_line != tab->cursor_y) {
+            tab->cursor_y = next_line;
+        }
     }
     
     int line_len = tab->buffer->lines[tab->cursor_y] ? 
@@ -125,7 +145,9 @@ void move_cursor_word_right(void) {
     
     if (tab->cursor_x >= len) {
         if (tab->cursor_y < tab->buffer->line_count - 1) {
-            tab->cursor_y++;
+            int next_line = get_next_visible_line(tab, tab->cursor_y);
+            if (next_line == tab->cursor_y) return;
+            tab->cursor_y = next_line;
             tab->cursor_x = 0;
             line = tab->buffer->lines[tab->cursor_y];
             if (line) {
@@ -164,7 +186,9 @@ void move_cursor_word_left(void) {
     
     if (tab->cursor_x == 0) {
         if (tab->cursor_y > 0) {
-            tab->cursor_y--;
+            int prev_line = get_prev_visible_line(tab, tab->cursor_y);
+            if (prev_line == tab->cursor_y) return;
+            tab->cursor_y = prev_line;
             line = tab->buffer->lines[tab->cursor_y];
             tab->cursor_x = line ? strlen(line) : 0;
         }
