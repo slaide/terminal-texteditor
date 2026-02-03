@@ -8,7 +8,30 @@
 void move_cursor(int dx, int dy) {
     Tab* tab = get_current_tab();
     if (!tab) return;
-    
+
+    if (dy == 0 && dx < 0 && tab->cursor_x == 0) {
+        if (tab->cursor_y > 0) {
+            tab->cursor_y--;
+            char *line = tab->buffer->lines[tab->cursor_y];
+            tab->cursor_x = line ? strlen(line) : 0;
+            editor.needs_full_redraw = true;
+        }
+        return;
+    }
+
+    if (dy == 0 && dx > 0) {
+        char *line = tab->buffer->lines[tab->cursor_y];
+        int line_len = line ? strlen(line) : 0;
+        if (tab->cursor_x >= line_len) {
+            if (tab->cursor_y < tab->buffer->line_count - 1) {
+                tab->cursor_y++;
+                tab->cursor_x = 0;
+                editor.needs_full_redraw = true;
+            }
+            return;
+        }
+    }
+
     tab->cursor_x += dx;
     tab->cursor_y += dy;
     
@@ -151,10 +174,8 @@ void move_cursor_word_left(void) {
     while (tab->cursor_x > 0 && !is_word_char(line[tab->cursor_x - 1])) {
         tab->cursor_x--;
     }
-    
-    if (tab->cursor_x >= 0 && is_word_char(line[tab->cursor_x])) {
-        while (tab->cursor_x > 0 && is_word_char(line[tab->cursor_x - 1])) {
-            tab->cursor_x--;
-        }
+
+    while (tab->cursor_x > 0 && is_word_char(line[tab->cursor_x - 1])) {
+        tab->cursor_x--;
     }
 }
