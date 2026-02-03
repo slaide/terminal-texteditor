@@ -247,8 +247,8 @@ static void draw_line_to_buf(RenderBuf *rb, int screen_y, int file_y, int start_
                         render_buf_append(rb, new_color);
                     } else {
                         render_buf_append(rb, COLOR_RESET);
-                        if (in_selection) render_buf_append(rb, "\033[7m"); // Restore selection
                     }
+                    if (in_selection) render_buf_append(rb, "\033[7m"); // Keep selection after color changes
                     current_color = new_color;
                 }
 
