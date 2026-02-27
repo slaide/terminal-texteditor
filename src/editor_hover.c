@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "editor_hover.h"
 #include "editor_tabs.h"
+#include "buffer.h"
 #include "editor_folds.h"
 #include "lsp.h"
 #include <stdio.h>
@@ -148,6 +149,218 @@ static void extract_last_identifier(const char *s, char *out, size_t out_sz) {
     out[id_len] = '\0';
 }
 
+static bool parse_struct_type_name(const char *text, char *out, size_t out_sz) {
+    if (!text || !out || out_sz == 0) return false;
+    out[0] = '\0';
+
+    const char *p = text;
+    while (p && *p) {
+        const char *line_end = strchr(p, '\n');
+        int line_len = line_end ? (int)(line_end - p) : (int)strlen(p);
+        if (line_len > 0) {
+            const char *type_pos = strstr(p, "Type:");
+            if (type_pos && type_pos < p + line_len) {
+                const char *struct_pos = strstr(type_pos, "struct");
+                if (struct_pos && struct_pos < p + line_len) {
+                    struct_pos += 6;
+                    while (struct_pos < p + line_len && isspace((unsigned char)*struct_pos)) {
+                        struct_pos++;
+                    }
+                    const char *name_start = struct_pos;
+                    while (struct_pos < p + line_len &&
+                           (isalnum((unsigned char)*struct_pos) || *struct_pos == '_')) {
+                        struct_pos++;
+                    }
+                    size_t name_len = (size_t)(struct_pos - name_start);
+                    if (name_len > 0 && name_len < out_sz) {
+                        memcpy(out, name_start, name_len);
+                        out[name_len] = '\0';
+                        return true;
+                    }
+                }
+            }
+        }
+        if (!line_end) break;
+        p = line_end + 1;
+    }
+    return false;
+}
+
+static char *build_struct_fields(TextBuffer *buffer, const char *struct_name, int start_line) {
+    if (!buffer || !struct_name || struct_name[0] == '\0') return NULL;
+
+    int count = 0;
+    const int max_items = 12;
+    bool in_struct = false;
+    int brace_depth = 0;
+    char *out = NULL;
+    int out_len = 0;
+    int out_cap = 0;
+    char *seen[64];
+    int seen_count = 0;
+
+    if (start_line < 0) start_line = 0;
+    if (start_line >= buffer->line_count) start_line = 0;
+
+    for (int i = start_line; i < buffer->line_count; i++) {
+        const char *src_line = buffer->lines[i];
+        if (!src_line) continue;
+        char *line = strdup(src_line);
+        if (!line) continue;
+
+        if (!in_struct) {
+            char *pos = strstr(line, "struct");
+            while (pos) {
+                char *name = pos + 6;
+                while (*name && isspace((unsigned char)*name)) name++;
+                if (strncmp(name, struct_name, strlen(struct_name)) == 0) {
+                    char next = name[strlen(struct_name)];
+                    if (next == '\0' || isspace((unsigned char)next) || next == '{') {
+                        in_struct = true;
+                        char *brace = strchr(name, '{');
+                        if (brace) {
+                            brace_depth = 1;
+                        }
+                        break;
+                    }
+                }
+                pos = strstr(pos + 6, "struct");
+            }
+            free(line);
+            if (in_struct) continue;
+            continue;
+        }
+
+        for (char *p = line; *p; p++) {
+            if (*p == '{') brace_depth++;
+            else if (*p == '}') brace_depth--;
+        }
+
+        if (brace_depth <= 0) {
+            free(line);
+            break;
+        }
+
+        char *comment = strstr(line, "//");
+        if (comment) *comment = '\0';
+        for (char *p = line; (p = strstr(p, "/*")) != NULL; ) {
+            char *end = strstr(p + 2, "*/");
+            if (end) {
+                memmove(p, end + 2, strlen(end + 2) + 1);
+            } else {
+                *p = '\0';
+                break;
+            }
+        }
+        char *trim = line;
+        while (*trim && isspace((unsigned char)*trim)) trim++;
+        if (*trim == '#') {
+            free(line);
+            continue;
+        }
+        char *semi = strchr(line, ';');
+        if (!semi || strchr(line, '(')) {
+            free(line);
+            continue;
+        }
+
+        char ident[64];
+        extract_last_identifier(line, ident, sizeof(ident));
+        if (ident[0] == '\0') {
+            free(line);
+            continue;
+        }
+
+        bool seen_dup = false;
+        for (int s = 0; s < seen_count; s++) {
+            if (strcmp(seen[s], ident) == 0) {
+                seen_dup = true;
+                break;
+            }
+        }
+        if (seen_dup) {
+            free(line);
+            continue;
+        }
+        if (seen_count < (int)(sizeof(seen) / sizeof(seen[0]))) {
+            seen[seen_count++] = strdup(ident);
+        }
+
+        if (count == 0) {
+            append_str(&out, &out_len, &out_cap, "\n\nFields:");
+        }
+        if (count < max_items) {
+            append_str(&out, &out_len, &out_cap, "\n- ");
+            append_str(&out, &out_len, &out_cap, ident);
+        }
+        count++;
+        free(line);
+    }
+
+    if (count > max_items) {
+        append_str(&out, &out_len, &out_cap, "\n- ...");
+    }
+
+    for (int s = 0; s < seen_count; s++) {
+        free(seen[s]);
+    }
+    return out;
+}
+
+static TextBuffer *get_buffer_for_path(const char *path, bool *out_owned) {
+    if (out_owned) *out_owned = false;
+    if (!path) return NULL;
+
+    int tab_idx = find_tab_with_file(path);
+    if (tab_idx >= 0) {
+        return editor.tabs[tab_idx].buffer;
+    }
+
+    TextBuffer *buffer = buffer_create();
+    if (!buffer) return NULL;
+    if (!buffer_load_from_file(buffer, path)) {
+        buffer_free(buffer);
+        return NULL;
+    }
+    if (out_owned) *out_owned = true;
+    return buffer;
+}
+
+static void hover_append_struct_fields_from_type_def(const char *uri, int line) {
+    if (!editor.hover_type_request_active || !editor.hover_type_struct_name ||
+        !editor.hover_type_base_text) {
+        return;
+    }
+
+    char *path = lsp_uri_to_path(uri);
+    if (!path) return;
+
+    bool owned = false;
+    TextBuffer *buffer = get_buffer_for_path(path, &owned);
+    free(path);
+    if (!buffer) return;
+
+    char *fields = build_struct_fields(buffer, editor.hover_type_struct_name, line);
+    if (owned) buffer_free(buffer);
+    if (!fields) return;
+
+    char *out = NULL;
+    int out_len = 0;
+    int out_cap = 0;
+    append_str(&out, &out_len, &out_cap, editor.hover_type_base_text);
+    append_str(&out, &out_len, &out_cap, fields);
+    free(fields);
+
+    if (!out) return;
+
+    if (editor.hover_text) {
+        free(editor.hover_text);
+    }
+    editor.hover_text = out;
+    editor.hover_active = true;
+    editor.needs_full_redraw = true;
+}
+
 static char *append_hover_members(const char *text) {
     if (!text) return NULL;
     const char *brace = strchr(text, '{');
@@ -219,6 +432,15 @@ void hover_clear(void) {
         free(editor.hover_text);
         editor.hover_text = NULL;
     }
+    if (editor.hover_type_struct_name) {
+        free(editor.hover_type_struct_name);
+        editor.hover_type_struct_name = NULL;
+    }
+    if (editor.hover_type_base_text) {
+        free(editor.hover_type_base_text);
+        editor.hover_type_base_text = NULL;
+    }
+    editor.hover_type_request_active = false;
     if (editor.hover_active) {
         editor.needs_full_redraw = true;
     }
@@ -351,4 +573,37 @@ void lsp_hover_handler(const char *uri, int line, int col, const char *text) {
     editor.hover_text = augmented ? augmented : strdup(text);
     editor.hover_active = editor.hover_text != NULL;
     editor.needs_full_redraw = true;
+
+    if (editor.hover_type_struct_name) {
+        free(editor.hover_type_struct_name);
+        editor.hover_type_struct_name = NULL;
+    }
+    if (editor.hover_type_base_text) {
+        free(editor.hover_type_base_text);
+        editor.hover_type_base_text = NULL;
+    }
+    editor.hover_type_request_active = false;
+
+    char struct_name[128];
+    if (parse_struct_type_name(editor.hover_text, struct_name, sizeof(struct_name)) &&
+        lsp_type_definition_is_supported() && tab_idx == editor.current_tab) {
+        editor.hover_type_struct_name = strdup(struct_name);
+        if (editor.hover_type_struct_name) {
+            editor.hover_type_base_text = strdup(editor.hover_text);
+            if (editor.hover_type_base_text) {
+                editor.hover_type_request_line = line;
+                editor.hover_type_request_col = col;
+                editor.hover_type_request_active = true;
+                Tab *tab = &editor.tabs[tab_idx];
+                lsp_request_type_definition(tab->filename, line, col);
+            }
+        }
+    }
+}
+
+void lsp_type_definition_handler(const char *uri, int line, int col) {
+    (void)col;
+    if (!editor.hover_type_request_active || !uri) return;
+    hover_append_struct_fields_from_type_def(uri, line);
+    editor.hover_type_request_active = false;
 }

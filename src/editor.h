@@ -146,6 +146,11 @@ typedef struct {
     int word_anchor_line;
     int word_anchor_start;
     int word_anchor_end;
+    bool hover_type_request_active;
+    int hover_type_request_line;
+    int hover_type_request_col;
+    char *hover_type_struct_name;
+    char *hover_type_base_text;
 
     // Completion popup state
     bool completion_active;

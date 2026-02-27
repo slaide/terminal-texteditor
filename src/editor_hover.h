@@ -9,5 +9,6 @@ void hover_show_diagnostic(int buffer_line, int screen_x, int screen_y);
 void hover_clear(void);
 void hover_request_cursor(Tab *tab);
 void lsp_hover_handler(const char *uri, int line, int col, const char *text);
+void lsp_type_definition_handler(const char *uri, int line, int col);
 
 #endif

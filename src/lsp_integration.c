@@ -12,6 +12,7 @@
 #define SEMANTIC_TOKENS_DELAY_MS 150
 
 void lsp_hover_handler(const char *uri, int line, int col, const char *text);
+void lsp_type_definition_handler(const char *uri, int line, int col);
 
 static long long monotonic_ms(void) {
     struct timespec now;
@@ -178,6 +179,7 @@ void notify_lsp_file_opened(Tab *tab) {
         lsp_set_diagnostics_callback(lsp_diagnostics_handler);
         lsp_set_semantic_tokens_callback(lsp_semantic_tokens_handler);
         lsp_set_hover_callback(lsp_hover_handler);
+        lsp_set_type_definition_callback(lsp_type_definition_handler);
         lsp_set_completion_callback(lsp_completion_handler);
     } else {
         return;

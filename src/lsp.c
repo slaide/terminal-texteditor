@@ -15,7 +15,8 @@
 typedef enum {
     REQ_SEMANTIC_TOKENS,
     REQ_HOVER,
-    REQ_COMPLETION
+    REQ_COMPLETION,
+    REQ_TYPE_DEFINITION
 } PendingRequestType;
 
 typedef struct {
@@ -38,9 +39,11 @@ static struct {
     lsp_diagnostics_callback diagnostics_cb;
     lsp_semantic_tokens_callback semantic_cb;
     lsp_hover_callback hover_cb;
+    lsp_type_definition_callback type_def_cb;
     lsp_completion_callback completion_cb;
     bool hover_supported;
     bool completion_supported;
+    bool type_def_supported;
 
     // Read buffer for incoming messages
     char *read_buf;
@@ -480,6 +483,64 @@ static void handle_hover_response(const PendingRequest *req, JsonValue *result) 
     free(text);
 }
 
+static bool extract_location_from_object(JsonValue *loc, const char **out_uri, int *out_line, int *out_col) {
+    if (!loc || loc->type != JSON_OBJECT) return false;
+    JsonValue *uri = json_object_get(loc, "uri");
+    JsonValue *range = json_object_get(loc, "range");
+    JsonValue *target_uri = json_object_get(loc, "targetUri");
+    JsonValue *target_range = json_object_get(loc, "targetRange");
+
+    if (target_uri && target_uri->type == JSON_STRING) {
+        uri = target_uri;
+        range = target_range;
+    }
+
+    if (!uri || uri->type != JSON_STRING || !range || range->type != JSON_OBJECT) return false;
+
+    JsonValue *start = json_object_get(range, "start");
+    if (!start || start->type != JSON_OBJECT) return false;
+    JsonValue *line = json_object_get(start, "line");
+    JsonValue *col = json_object_get(start, "character");
+    if (!line || !col) return false;
+
+    *out_uri = json_get_string(uri);
+    *out_line = (int)json_get_number(line);
+    *out_col = (int)json_get_number(col);
+    return *out_uri != NULL;
+}
+
+static void handle_type_definition_response(const PendingRequest *req, JsonValue *result) {
+    if (!req || !lsp.type_def_cb) return;
+    if (!result) {
+        lsp.type_def_cb(req->uri, -1, -1);
+        return;
+    }
+
+    const char *uri = NULL;
+    int line = -1;
+    int col = -1;
+
+    if (result->type == JSON_ARRAY) {
+        JsonValue *first = json_array_get(result, 0);
+        extract_location_from_object(first, &uri, &line, &col);
+    } else if (result->type == JSON_OBJECT) {
+        extract_location_from_object(result, &uri, &line, &col);
+    }
+
+    if (!uri) {
+        lsp.type_def_cb(req->uri, -1, -1);
+        return;
+    }
+
+    char *uri_copy = strdup(uri);
+    if (!uri_copy) {
+        lsp.type_def_cb(req->uri, -1, -1);
+        return;
+    }
+    lsp.type_def_cb(uri_copy, line, col);
+    free(uri_copy);
+}
+
 static void handle_message(JsonValue *msg) {
     if (!msg) return;
 
@@ -545,6 +606,14 @@ static void handle_message(JsonValue *msg) {
                                 if (t) lsp.token_types[i] = strdup(t);
                             }
                         }
+                    }
+                }
+                JsonValue *typeDefProvider = json_object_get(caps, "typeDefinitionProvider");
+                if (typeDefProvider) {
+                    if (typeDefProvider->type == JSON_BOOL) {
+                        lsp.type_def_supported = json_get_bool(typeDefProvider);
+                    } else if (typeDefProvider->type == JSON_OBJECT) {
+                        lsp.type_def_supported = true;
                     }
                 }
             }
@@ -627,6 +696,12 @@ static void handle_message(JsonValue *msg) {
                         free_completion_items(out, out_count);
                         free(out);
                     }
+                }
+            } else if (req.type == REQ_TYPE_DEFINITION) {
+                if (!result && error_msg && lsp.type_def_cb) {
+                    lsp.type_def_cb(req.uri, -1, -1);
+                } else {
+                    handle_type_definition_response(&req, result);
                 }
             }
             if (req.uri) free(req.uri);
@@ -1171,6 +1246,42 @@ void lsp_request_completion(const char *path, int line, int col, const char *tri
 
 bool lsp_hover_is_supported(void) {
     return lsp.hover_supported;
+}
+
+void lsp_set_type_definition_callback(lsp_type_definition_callback cb) {
+    lsp.type_def_cb = cb;
+}
+
+void lsp_request_type_definition(const char *path, int line, int col) {
+    if (!lsp.running || !path) return;
+    char *uri = lsp_path_to_uri(path);
+    if (!uri) return;
+
+    JsonValue *params = json_object();
+    JsonValue *textDoc = json_object();
+    JsonValue *position = json_object();
+    json_object_set(textDoc, "uri", json_string(uri));
+    json_object_set(position, "line", json_number(line));
+    json_object_set(position, "character", json_number(col));
+    json_object_set(params, "textDocument", textDoc);
+    json_object_set(params, "position", position);
+
+    JsonValue *msg = json_object();
+    json_object_set(msg, "jsonrpc", json_string("2.0"));
+    json_object_set(msg, "id", json_number(++lsp.request_id));
+    json_object_set(msg, "method", json_string("textDocument/typeDefinition"));
+    json_object_set(msg, "params", params);
+
+    int id = lsp.request_id;
+    if (send_message(msg)) {
+        add_pending_request(id, uri, REQ_TYPE_DEFINITION, line, col);
+    }
+    json_free(msg);
+    free(uri);
+}
+
+bool lsp_type_definition_is_supported(void) {
+    return lsp.type_def_supported;
 }
 
 bool lsp_completion_is_supported(void) {

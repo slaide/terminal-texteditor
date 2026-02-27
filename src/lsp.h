@@ -68,6 +68,7 @@ typedef void (*lsp_semantic_tokens_callback)(const char *uri, SemanticToken *tok
 
 // Callback for hover info
 typedef void (*lsp_hover_callback)(const char *uri, int line, int col, const char *text);
+typedef void (*lsp_type_definition_callback)(const char *uri, int line, int col);
 
 // Completion item
 typedef struct {
@@ -105,6 +106,9 @@ void lsp_request_semantic_tokens(const char *path);
 void lsp_set_hover_callback(lsp_hover_callback cb);
 void lsp_request_hover(const char *path, int line, int col);
 bool lsp_hover_is_supported(void);
+void lsp_set_type_definition_callback(lsp_type_definition_callback cb);
+void lsp_request_type_definition(const char *path, int line, int col);
+bool lsp_type_definition_is_supported(void);
 
 // Completion
 void lsp_set_completion_callback(lsp_completion_callback cb);
